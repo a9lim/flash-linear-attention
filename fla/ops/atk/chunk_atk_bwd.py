@@ -95,24 +95,24 @@ def _atk_backward_chunk_out(
 
     log_g_val = tl.load(log_g_ptr, mask=mask_T, other=0.0).to(tl.float32)
     beta_val = tl.load(beta_ptr, mask=mask_T, other=0.0).to(tl.float32)
-    g_val = tl.exp(log_g_val)
 
+    # Forward closed form (see the forward kernel):
+    #   A_t = exp(c_t) * ac + sum_{j <= t} exp(c_t - c_j) * U_j.
+    # The adjoint of that recurrence is the mirror reverse scan
+    #   Lam_j = sum_{t >= j} exp(c_t - c_j) * gA_t,
+    # which is dL/dU_j directly, and gives
+    #   dL/dlog_g_t = Lam_t . (A_t - U_t),   dL/dac = sum_t exp(c_t) * gA_t.
+    # One decay tile serves both directions; no [C, C] gradient is materialized.
     la_cumsum = tl.cumsum(log_g_val)
-
-    roll_mat = (C_range[:, None] == (C_range[None, :] + 1)).to(tl.float32)
-    la_cumsum_roll = tl.sum(roll_mat[:, :] * la_cumsum[None, :], 1)
-    M = tl.exp(la_cumsum_roll[:, None] - la_cumsum[None, :])
-    M = tl.where(C_range[:, None] > C_range[None, :], M, 0.0)
-
-    base_decays = tl.exp(la_cumsum_roll * (C_range > 0).to(tl.float32))
+    decay_mat = tl.exp(la_cumsum[:, None] - la_cumsum[None, :])
+    decay_mat = tl.where(C_range[:, None] > C_range[None, :], decay_mat, 0.0)
+    carry_decays = tl.exp(la_cumsum)
 
     center = tl.load(log_atk_scale + h).to(tl.float32)
 
-    gg_val = tl.zeros([CHUNK_LEN], dtype=tl.float32)
+    glog_g_val = tl.zeros([CHUNK_LEN], dtype=tl.float32)
     gbeta_val = tl.zeros([CHUNK_LEN], dtype=tl.float32)
     g_center = tl.zeros([], dtype=tl.float32)
-    gbase_decays = tl.zeros([CHUNK_LEN], dtype=tl.float32)
-    gM = tl.zeros([CHUNK_LEN, CHUNK_LEN], dtype=tl.float32)
 
     for i_k in range(tl.cdiv(D, BK)):
         d_offset = i_k * BK
@@ -142,8 +142,7 @@ def _atk_backward_chunk_out(
         else:
             ac_val = tl.load(ac_ptr, mask=mask_D)
 
-        raw_state = base_decays[:, None] * ac_val[None, :] + tl.dot(M, U)
-        A_t = g_val[:, None] * raw_state + U
+        A_t = tl.dot(decay_mat, U) + U + carry_decays[:, None] * ac_val[None, :]
 
         ell = tl.log(A_t + eps)
         r = ell - center
@@ -160,25 +159,20 @@ def _atk_backward_chunk_out(
         gr_local = gs * ds_dr
         g_center += -tl.sum(gr_local)
         gA_t = gr_local / (A_t + eps)
-        graw_state = gA_t * g_val[:, None]
-        gg_val += tl.sum(gA_t * raw_state, 1)
-        gU = gA_t
 
-        gU_from_M = tl.dot(tl.trans(M), graw_state)
+        # Reverse scan: total adjoint of A_j, i.e. dL/dU_j.
+        gU_total = tl.dot(tl.trans(decay_mat), gA_t) + gA_t
 
-        gk_sq = (gU + gU_from_M) * beta_val[:, None]
-        gbeta_val += tl.sum(gU * k_sq, 1) + tl.sum(gU_from_M * k_sq, 1)
-        gk_val += 2 * k_val * gk_sq
+        gbeta_val += tl.sum(gU_total * k_sq, 1)
+        gk_val += 2 * k_val * (gU_total * beta_val[:, None])
+        glog_g_val += tl.sum(gU_total * (A_t - U), 1)
 
-        gac_tile = tl.sum(graw_state * base_decays[:, None], 0)
+        gac_tile = tl.sum(gA_t * carry_decays[:, None], 0)
         gac_ptr = gac_prev + i_n * gac_stride_b + h * gac_stride_h + (chunk_id - 1) * gac_stride_c + D_range * gac_stride_d
         if chunk_id > 0:
             tl.store(gac_ptr, gac_tile, mask=mask_D)
         elif USE_INITIAL_STATE:
             tl.store(dh0 + (i_n * H + h) * D + D_range, gac_tile, mask=mask_D)
-
-        gbase_decays += tl.sum(graw_state * ac_val[None, :], 1)
-        gM += tl.dot(graw_state, tl.trans(U))
 
         if IS_VARLEN:
             gk_ptr = gk_out + (bos + T_range)[:, None] * gk_stride_t + h * gk_stride_h + D_range[None, :] * gk_stride_d
@@ -186,21 +180,6 @@ def _atk_backward_chunk_out(
             gk_ptr = gk_out + b * gk_stride_b + T_range[:, None] * \
                 gk_stride_t + h * gk_stride_h + D_range[None, :] * gk_stride_d
         tl.store(gk_ptr, gk_val, mask=mask_T[:, None] * mask_D[None, :])
-
-    glog_g_val = gg_val * g_val
-
-    gbase_decays = gbase_decays * (C_range > 0)
-    gla_cumsum_roll = gbase_decays * base_decays
-
-    gM = tl.where(C_range[:, None] > C_range[None, :], gM, 0.0)
-    ginner_sum = M * gM
-    gla_cumsum_roll += tl.sum(ginner_sum, 1)
-    gla_cumsum = -1 * tl.sum(ginner_sum, 0)
-
-    roll_mat = (C_range[:, None] == (C_range[None, :] + 1)).to(tl.float32)
-    gla_cumsum += tl.sum(roll_mat * gla_cumsum_roll[:, None], 0) * (C_range < (CHUNK_LEN - 1)).to(tl.float32)
-
-    glog_g_val += tl.cumsum(gla_cumsum, reverse=True)
 
     if IS_VARLEN:
         gg_ptr = gg_out + (bos + T_range) * gg_stride_t + h * gg_stride_h

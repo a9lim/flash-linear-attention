@@ -249,16 +249,15 @@ def _forward_chunk_out(
 
     beta_val = tl.load(beta_ptr, mask=mask_T, other=0.0).to(tl.float32)
     log_g_val = tl.load(log_g_ptr, mask=mask_T, other=0.0).to(tl.float32)
-    g_val = tl.exp(log_g_val)
 
+    # With c = cumsum(log_g) the diagonal recurrence closes to
+    #   A_t = exp(c_t) * ac + sum_{j <= t} exp(c_t - c_j) * U_j,
+    # so one strictly-lower [C, C] decay tile plus an exact diagonal term is
+    # enough; no rolled cumsum and no separate base-decay vector.
     la_cumsum = tl.cumsum(log_g_val)
-
-    roll_mat = (C_range[:, None] == (C_range[None, :] + 1)).to(tl.float32)
-    la_cumsum_roll = tl.sum(roll_mat[:, :] * la_cumsum[None, :], 1)
-    M = tl.exp(la_cumsum_roll[:, None] - la_cumsum[None, :])
-    M = tl.where(C_range[:, None] > C_range[None, :], M, 0.0)
-
-    base_decays = tl.exp(la_cumsum_roll * (C_range > 0).to(tl.float32))
+    decay_mat = tl.exp(la_cumsum[:, None] - la_cumsum[None, :])
+    decay_mat = tl.where(C_range[:, None] > C_range[None, :], decay_mat, 0.0)
+    carry_decays = tl.exp(la_cumsum)
 
     center = tl.load(log_atk_scale + h).to(tl.float32)
 
@@ -290,9 +289,7 @@ def _forward_chunk_out(
         else:
             ac_val = tl.load(ac_ptr, mask=mask_D)
 
-        raw_state = base_decays[:, None] * ac_val[None, :] + tl.dot(M, U)
-
-        A_t = g_val[:, None] * raw_state + U
+        A_t = tl.dot(decay_mat, U) + U + carry_decays[:, None] * ac_val[None, :]
 
         ell = tl.log(A_t + eps)
         r = ell - center
