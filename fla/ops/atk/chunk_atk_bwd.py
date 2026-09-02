@@ -405,7 +405,12 @@ def _atk_backward_chunk_summary(
         gk_sq = gU * beta_val[:, None]
         gk_val = gk_sq * k_val * 2
 
-        tl.atomic_add(gk_ptr, gk_val, mask=mask_T[:, None] * mask_D[None, :])
+        # Every (sequence, head, chunk, k-tile) is owned by exactly one program
+        # here and in the chunk-out kernel that wrote the buffer, so the
+        # accumulation is a plain, deterministic read-add-write.
+        mask_TD = mask_T[:, None] * mask_D[None, :]
+        gk_val += tl.load(gk_ptr, mask=mask_TD, other=0.0)
+        tl.store(gk_ptr, gk_val, mask=mask_TD)
 
     gdecays_exp = decays * gdecays
 
@@ -421,8 +426,10 @@ def _atk_backward_chunk_summary(
         gg_ptr = gg_out + b * gg_stride_b + T_range * gg_stride_t + h * gg_stride_h
         gbeta_ptr = gbeta_out + b * gbeta_stride_b + T_range * gbeta_stride_t + h * gbeta_stride_h
 
-    tl.atomic_add(gg_ptr, glog_g_val, mask=mask_T)
-    tl.atomic_add(gbeta_ptr, gbeta_val, mask=mask_T)
+    glog_g_val += tl.load(gg_ptr, mask=mask_T, other=0.0)
+    gbeta_val += tl.load(gbeta_ptr, mask=mask_T, other=0.0)
+    tl.store(gg_ptr, glog_g_val, mask=mask_T)
+    tl.store(gbeta_ptr, gbeta_val, mask=mask_T)
 
 
 def chunk_atk_bwd(
