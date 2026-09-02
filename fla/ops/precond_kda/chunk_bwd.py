@@ -16,6 +16,10 @@ from fla.utils import IS_NVIDIA_HOPPER, autotune_cache_kwargs, check_shared_mem
 BK_LIST = [32, 64] if check_shared_mem() else [16, 32]
 BV_LIST = [64, 128] if check_shared_mem('ampere') else [16, 32]
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
+# The WY/inter backward reloads its V-side tiles once per K tile, so a wider V
+# tile trades shared memory for traffic; it owns its own list and drops the
+# configs the target cannot fit.
+WY_BV_LIST = sorted(set(BV_LIST + [64, 128]))
 
 
 # ==============================================================================
@@ -169,7 +173,7 @@ def chunk_precond_kda_bwd_dAv(
     configs=[
         triton.Config({'BK': BK, 'BV': BV}, num_warps=num_warps, num_stages=num_stages)
         for BK in BK_LIST
-        for BV in BV_LIST
+        for BV in WY_BV_LIST
         for num_warps in NUM_WARPS
         for num_stages in [2, 3, 4]
         if not (IS_NVIDIA_HOPPER and BK == 32 and num_warps == 4)
@@ -258,6 +262,23 @@ def chunk_precond_kda_bwd_kernel_wy_dqkg(
     b_dA = tl.zeros([BT, BT], dtype=tl.float32)
     b_db = tl.zeros([BT], dtype=tl.float32)
 
+    # With a single V tile the V-side operands and the whole WY-value block are
+    # invariant across the i_k loop; load and run them once.
+    if V <= BV:
+        o_v = tl.arange(0, BV)
+        m_v = o_v < V
+        m_tv = m_t[:, None] & m_v[None, :]
+        b_v_new = tl.load(v_new + o_t[:, None] * (H*V) + o_v[None, :], mask=m_tv, other=0.0)
+        b_do = tl.load(do + o_t[:, None] * (H*V) + o_v[None, :], mask=m_tv, other=0.0)
+        b_dv = tl.load(dv + o_t[:, None] * (H*V) + o_v[None, :], mask=m_tv, other=0.0)
+        b_v = tl.load(v + o_t[:, None] * (H*V) + o_v[None, :], mask=m_tv, other=0.0)
+
+        b_dA += tl.dot(b_dv, tl.trans(b_v))
+        b_dvb = tl.dot(b_A, b_dv)
+        b_db += tl.sum(b_dvb * b_v, 1)
+        p_dv2 = dv2 + o_t[:, None] * (H*V) + o_v[None, :]
+        tl.store(p_dv2, (b_dvb * b_beta[:, None]).to(dv2.dtype.element_ty), mask=m_tv)
+
     for i_k in range(tl.cdiv(K, BK)):
         o_k = i_k * BK + tl.arange(0, BK)
         m_k = o_k < K
@@ -278,7 +299,26 @@ def chunk_precond_kda_bwd_kernel_wy_dqkg(
         b_dw = tl.zeros([BT, BK], dtype=tl.float32)
         b_dgk = tl.zeros([BK], dtype=tl.float32)
 
-        for i_v in range(tl.cdiv(V, BV)):
+        if V <= BV:
+            o_v = tl.arange(0, BV)
+            m_v = o_v < V
+            m_vk = m_v[:, None] & m_k[None, :]
+            if TRANSPOSE_STATE:
+                p_h = h + o_v[:, None] * K + o_k[None, :]
+                p_dh = dh + o_v[:, None] * K + o_k[None, :]
+            else:
+                p_h = h + o_v[:, None] + o_k[None, :] * V
+                p_dh = dh + o_v[:, None] + o_k[None, :] * V
+            # [BV, BK]
+            b_h = tl.load(p_h, mask=m_vk, other=0.0)
+            b_dh = tl.load(p_dh, mask=m_vk, other=0.0)
+
+            b_dgk += tl.sum(b_h * b_dh, axis=0)
+            b_dq += tl.dot(b_do, b_h.to(b_do.dtype))
+            b_dkg_raw += tl.dot(b_v_new, b_dh.to(b_v_new.dtype))
+            b_dw += tl.dot(b_dv.to(b_v_new.dtype), b_h.to(b_v_new.dtype))
+        else:
+          for i_v in range(tl.cdiv(V, BV)):
             o_v = i_v * BV + tl.arange(0, BV)
             m_v = o_v < V
             m_tv = m_t[:, None] & m_v[None, :]
