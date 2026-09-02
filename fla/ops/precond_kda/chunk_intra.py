@@ -620,16 +620,22 @@ def chunk_precond_kda_fwd_intra(
     return w, u, kg, Aqk, Akk
 
 
+# Widest K tile the intra backward owns per program; K above it is split into
+# NK partial programs whose dbeta partials are summed afterwards.
+BWD_INTRA_BK = 32
+
+
 @triton.heuristics({
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+        triton.Config({'BC': BC}, num_warps=num_warps, num_stages=num_stages)
+        for BC in [16, 32]
         for num_warps in [1, 2, 4, 8]
-        for num_stages in [2, 3, 4]
+        for num_stages in [2, 3]
     ],
-    key=['BK', 'NC', 'BT'],
+    key=['BK', 'BT', 'K', 'H'],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['B', 'T'])
@@ -659,7 +665,6 @@ def chunk_precond_kda_bwd_kernel_intra(
     BT: tl.constexpr,
     BC: tl.constexpr,
     BK: tl.constexpr,
-    NC: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     SAFE_GATE: tl.constexpr = False,
     USE_GATHER: tl.constexpr = False,
@@ -677,6 +682,7 @@ def chunk_precond_kda_bwd_kernel_intra(
         Aqk[t, s] = q[t] @ k_precond[s]^T * exp(g[t] - g[s]) * beta[s]  (for t >= s)
         Akk[t, s] = k[t] @ k_precond[s]^T * exp(g[t] - g[s]) * beta[s]  (for t > s)
     """
+    NC: tl.constexpr = tl.cdiv(BT, BC)
     i_kc, i_t, i_bh = tl.program_id(0), tl.program_id(1).to(tl.int64), tl.program_id(2).to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
     i_k = i_kc // NC
@@ -964,13 +970,11 @@ def chunk_precond_kda_bwd_intra(
     """
     B, T, H, K = k.shape
     BT = chunk_size
-    BC = min(16, BT)
-    BK = min(32, triton.next_power_of_2(K))
+    BK = min(BWD_INTRA_BK, triton.next_power_of_2(K))
 
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    NC = triton.cdiv(BT, BC)
     NK = triton.cdiv(K, BK)
 
     dq2 = torch.empty_like(q)
@@ -979,7 +983,8 @@ def chunk_precond_kda_bwd_intra(
     db2 = beta.new_empty(NK, *beta.shape, dtype=torch.float)
     dg2 = torch.empty_like(dg, dtype=torch.float)
 
-    grid = (NK * NC, NT, B * H)
+    def grid(meta):
+        return (NK * triton.cdiv(BT, meta['BC']), NT, B * H)
     chunk_precond_kda_bwd_kernel_intra[grid](
         q=q,
         k=k,
@@ -1004,9 +1009,7 @@ def chunk_precond_kda_bwd_intra(
         H=H,
         K=K,
         BT=BT,
-        BC=BC,
         BK=BK,
-        NC=NC,
         SAFE_GATE=safe_gate,
         USE_GATHER=IS_GATHER_SUPPORTED,
     )
