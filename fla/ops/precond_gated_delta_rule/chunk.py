@@ -46,7 +46,7 @@ def chunk_precond_gated_delta_rule_fwd(
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, 64)
 
-    k_precond, at = chunk_atk_fwd(
+    k_precond, _, _, _, at = chunk_atk_fwd(
         k=k_write,
         beta=beta_atk,
         log_g=g_atk,

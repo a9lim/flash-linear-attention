@@ -433,13 +433,15 @@ def chunk_atk_fwd(
 ):
     r"""
     Chunked ATK forward: computes preconditioned keys via 3-stage chunk algorithm.
+
+    Returns ``(k_precond, ac, a, sa, at)``; the scan buffers let a caller keep the
+    forward products for the backward pass instead of recomputing them.
     """
-    k_precond, _, _, _, at = _atk_fwd_stages(
+    return _atk_fwd_stages(
         k, beta, log_g, chunk_size,
         initial_A_state, output_final_state, cu_seqlens,
         x, eps, log_atk_scale,
     )
-    return k_precond, at
 
 
 @torch._dynamo.disable

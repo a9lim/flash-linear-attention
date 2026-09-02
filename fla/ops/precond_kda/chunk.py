@@ -11,7 +11,7 @@ import torch
 
 from fla.modules.l2norm import l2norm_bwd, l2norm_fwd
 from fla.ops.atk.chunk_atk_bwd import chunk_atk_bwd
-from fla.ops.atk.chunk_atk_fwd import chunk_atk_fwd, recompute_atk_fwd
+from fla.ops.atk.chunk_atk_fwd import chunk_atk_fwd
 from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu, chunk_gated_delta_rule_fwd_h
 from fla.ops.cp import FLACPContext
 from fla.ops.gla.chunk import chunk_gla_fwd_o_gk
@@ -66,13 +66,13 @@ def chunk_precond_kda_fwd(
         log_atk_scale: per-head log-space center [H]
 
     Returns:
-        o, Aqk, Akk, final_state, at
+        o, Aqk, Akk, final_state, at, w, u, kg, v_new, h, k_precond, ac_atk, a_atk, sa_atk
     """
     B, T, H, K = k.shape
 
     # Step 1: ATK preconditioning with symmetric fast squash
-    # Only need k_precond and at (final state); ac/a_atk/sa_atk recomputed in backward
-    k_precond, at = chunk_atk_fwd(
+    # k_precond and the scan buffers are kept for backward instead of recomputed
+    k_precond, ac_atk, a_atk, sa_atk, at = chunk_atk_fwd(
         k=k,
         beta=beta_atk,
         log_g=g_atk,
@@ -129,7 +129,7 @@ def chunk_precond_kda_fwd(
         state_v_first=transpose_state_layout,
     )
 
-    return o, Aqk, Akk, final_state, at, w, u, kg, v_new, h
+    return o, Aqk, Akk, final_state, at, w, u, kg, v_new, h, k_precond, ac_atk, a_atk, sa_atk
 
 
 def chunk_precond_kda_bwd(
@@ -164,6 +164,10 @@ def chunk_precond_kda_bwd(
     v_new: torch.Tensor | None = None,
     h: torch.Tensor | None = None,
     dat: torch.Tensor | None = None,
+    k_precond: torch.Tensor | None = None,
+    ac_atk: torch.Tensor | None = None,
+    a_atk: torch.Tensor | None = None,
+    sa_atk: torch.Tensor | None = None,
 ):
     """
     Backward pass for preconditioned KDA with symmetric fast squash preconditioning.
@@ -171,19 +175,7 @@ def chunk_precond_kda_bwd(
     Returns:
         dq, dk, dv, dg, dg_atk, dbeta_atk, dbeta, d_log_atk_scale, dh0
     """
-    # Recompute ATK forward intermediates (k_precond, ac, a_atk, sa_atk)
-    k_precond, ac, a_atk, sa_atk = recompute_atk_fwd(
-        k=k,
-        beta=beta_atk,
-        log_g=g_atk,
-        chunk_size=chunk_size,
-        initial_A_state=initial_A_state,
-        cu_seqlens=cu_seqlens,
-        x=x,
-        eps=eps,
-        log_atk_scale=log_atk_scale,
-    )
-
+    # k_precond and the ATK scan buffers (ac_atk, a_atk, sa_atk) come from the forward.
     if not disable_recompute:
         # Step 1: Recompute WY representation (asymmetric)
         w, u, qg, kg = recompute_w_u_fwd(
@@ -309,7 +301,7 @@ def chunk_precond_kda_bwd(
         k=k,
         g_raw=g_atk,
         beta=beta_atk,
-        ac=ac,
+        ac=ac_atk,
         a=a_atk,
         sa=sa_atk,
         dk_precond=dk_precond_total,
@@ -396,7 +388,8 @@ class ChunkPrecondKDAFunction(torch.autograd.Function):
                 chunk_indices=chunk_indices,
             )
 
-        o, Aqk, Akk, final_state, at, w, u, kg, v_new, h = chunk_precond_kda_fwd(
+        (o, Aqk, Akk, final_state, at, w, u, kg, v_new, h,
+         k_precond, ac_atk, a_atk, sa_atk) = chunk_precond_kda_fwd(
             q=q,
             k=k,
             v=v,
@@ -437,7 +430,8 @@ class ChunkPrecondKDAFunction(torch.autograd.Function):
             q, q_rstd, k, k_rstd, v, g, g_org, g_atk, beta_atk, beta,
             Aqk, Akk, initial_state,
             A_log, dt_bias, log_atk_scale, cu_seqlens, chunk_indices,
-            w, u, kg, v_new, h
+            w, u, kg, v_new, h,
+            k_precond, ac_atk, a_atk, sa_atk
         )
         ctx.scale = scale
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
@@ -461,7 +455,8 @@ class ChunkPrecondKDAFunction(torch.autograd.Function):
         (q, q_rstd, k, k_rstd, v, g, g_org, g_atk, beta_atk, beta,
          Aqk, Akk, initial_state,
          A_log, dt_bias, log_atk_scale, cu_seqlens, chunk_indices,
-         w, u, kg, v_new, h) = ctx.saved_tensors
+         w, u, kg, v_new, h,
+         k_precond, ac_atk, a_atk, sa_atk) = ctx.saved_tensors
 
         # Recompute g (cumsummed) if use_gate_in_kernel was used
         if ctx.use_gate_in_kernel:
@@ -513,6 +508,10 @@ class ChunkPrecondKDAFunction(torch.autograd.Function):
             v_new=v_new,
             h=h,
             dat=dat,
+            k_precond=k_precond,
+            ac_atk=ac_atk,
+            a_atk=a_atk,
+            sa_atk=sa_atk,
         )
 
         if ctx.use_qk_l2norm_in_kernel:
