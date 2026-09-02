@@ -17,6 +17,7 @@ from fla.utils import autotune_cache_kwargs
 @triton.heuristics({
     'STORE_QG': lambda args: args['qg'] is not None,
     'STORE_KG': lambda args: args['kg'] is not None,
+    'STORE_WU': lambda args: args['w'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @triton.autotune(
@@ -52,6 +53,7 @@ def recompute_w_u_fwd_kernel(
     BV: tl.constexpr,
     STORE_QG: tl.constexpr,
     STORE_KG: tl.constexpr,
+    STORE_WU: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     DOT_PRECISION: tl.constexpr = 'tf32x3',
 ):
@@ -59,6 +61,8 @@ def recompute_w_u_fwd_kernel(
     Asymmetric WY representation:
     - w = A @ (k * beta * exp(gk)) - uses original k for read/correction
     - kg = k_precond * exp(gn - gk) - uses k_precond for write/h update
+    With STORE_WU=False only the gated projections qg/kg are produced, which is
+    what a backward that retained w/u from the forward needs.
     """
     i_t, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
@@ -72,36 +76,31 @@ def recompute_w_u_fwd_kernel(
     o_t = i_t * BT + tl.arange(0, BT)
     m_t = o_t < T
 
-    b_b = tl.load(beta + bos*H + i_h + o_t*H, mask=m_t, other=0.0)
+    if STORE_WU:
+        b_b = tl.load(beta + bos*H + i_h + o_t*H, mask=m_t, other=0.0)
 
-    o_A = tl.arange(0, BT)
-    p_A = A + (bos*H + i_h) * BT + o_t[:, None] * (H*BT) + o_A[None, :]
-    b_A = tl.load(p_A, mask=m_t[:, None] & (o_A[None, :] < BT), other=0.0)
+        o_A = tl.arange(0, BT)
+        p_A = A + (bos*H + i_h) * BT + o_t[:, None] * (H*BT) + o_A[None, :]
+        b_A = tl.load(p_A, mask=m_t[:, None] & (o_A[None, :] < BT), other=0.0)
 
-    # u computation (unchanged)
-    for i_v in range(tl.cdiv(V, BV)):
-        o_v = i_v * BV + tl.arange(0, BV)
-        m_tv = m_t[:, None] & (o_v[None, :] < V)
-        p_v = v + (bos*H + i_h) * V + o_t[:, None] * (H*V) + o_v[None, :]
-        p_u = u + (bos*H + i_h) * V + o_t[:, None] * (H*V) + o_v[None, :]
-        b_v = tl.load(p_v, mask=m_tv, other=0.0)
-        b_vb = (b_v * b_b[:, None]).to(b_v.dtype)
-        b_u = tl.dot(b_A, b_vb, input_precision=DOT_PRECISION)
-        tl.store(p_u, b_u.to(u.dtype.element_ty), mask=m_tv)
+        # u computation (unchanged)
+        for i_v in range(tl.cdiv(V, BV)):
+            o_v = i_v * BV + tl.arange(0, BV)
+            m_tv = m_t[:, None] & (o_v[None, :] < V)
+            p_v = v + (bos*H + i_h) * V + o_t[:, None] * (H*V) + o_v[None, :]
+            p_u = u + (bos*H + i_h) * V + o_t[:, None] * (H*V) + o_v[None, :]
+            b_v = tl.load(p_v, mask=m_tv, other=0.0)
+            b_vb = (b_v * b_b[:, None]).to(b_v.dtype)
+            b_u = tl.dot(b_A, b_vb, input_precision=DOT_PRECISION)
+            tl.store(p_u, b_u.to(u.dtype.element_ty), mask=m_tv)
 
     for i_k in range(tl.cdiv(K, BK)):
         o_k = i_k * BK + tl.arange(0, BK)
         m_k = o_k < K
         m_tk = m_t[:, None] & m_k[None, :]
-        p_w = w + (bos*H + i_h) * K + o_t[:, None] * (H*K) + o_k[None, :]
-        # Use original k for w (read/correction)
-        p_k = k + (bos*H + i_h) * K + o_t[:, None] * (H*K) + o_k[None, :]
-        b_k = tl.load(p_k, mask=m_tk, other=0.0)
-        b_kb = b_k * b_b[:, None]
 
         p_gk = gk + (bos*H + i_h) * K + o_t[:, None] * (H*K) + o_k[None, :]
         b_gk = tl.load(p_gk, mask=m_tk, other=0.0)
-        b_kb *= exp2(b_gk)
 
         if STORE_QG:
             p_q = q + (bos*H + i_h) * K + o_t[:, None] * (H*K) + o_k[None, :]
@@ -122,9 +121,16 @@ def recompute_w_u_fwd_kernel(
             p_kg = kg + (bos * H + i_h) * K + o_t[:, None] * (H*K) + o_k[None, :]
             tl.store(p_kg, b_kg.to(kg.dtype.element_ty), mask=m_tk)
 
-        # w uses original k
-        b_w = tl.dot(b_A, b_kb.to(b_k.dtype))
-        tl.store(p_w, b_w.to(w.dtype.element_ty), mask=m_tk)
+        if STORE_WU:
+            p_w = w + (bos*H + i_h) * K + o_t[:, None] * (H*K) + o_k[None, :]
+            # Use original k for w (read/correction)
+            p_k = k + (bos*H + i_h) * K + o_t[:, None] * (H*K) + o_k[None, :]
+            b_k = tl.load(p_k, mask=m_tk, other=0.0)
+            b_kb = b_k * b_b[:, None]
+            b_kb *= exp2(b_gk)
+            # w uses original k
+            b_w = tl.dot(b_A, b_kb.to(b_k.dtype))
+            tl.store(p_w, b_w.to(w.dtype.element_ty), mask=m_tk)
 
 
 def recompute_w_u_fwd(
@@ -139,6 +145,7 @@ def recompute_w_u_fwd(
     q: torch.Tensor | None = None,
     output_qg: bool = False,
     output_kg: bool = True,
+    output_wu: bool = True,
 ):
     """
     Compute WY representation for preconditioned KDA.
@@ -152,8 +159,8 @@ def recompute_w_u_fwd(
         gk: [B, T, H, K] - cumsum of gates
 
     Returns:
-        w: [B, T, H, K] - A @ (k * beta * exp(gk))
-        u: [B, T, H, V] - A @ (v * beta)
+        w: [B, T, H, K] or None - A @ (k * beta * exp(gk))
+        u: [B, T, H, V] or None - A @ (v * beta)
         qg: [B, T, H, K] or None - q * exp(gk)
         kg: [B, T, H, K] or None - k_precond * exp(gn - gk) for h update
     """
@@ -167,8 +174,8 @@ def recompute_w_u_fwd(
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
-    w = torch.empty_like(k)
-    u = torch.empty_like(v)
+    w = torch.empty_like(k) if output_wu else None
+    u = torch.empty_like(v) if output_wu else None
     qg = torch.empty_like(q) if output_qg and q is not None else None
     kg = torch.empty_like(k_precond) if output_kg else None
 

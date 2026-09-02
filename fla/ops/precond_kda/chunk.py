@@ -225,6 +225,7 @@ def chunk_precond_kda_bwd(
             q=q,
             output_qg=True,
             output_kg=False,
+            output_wu=False,
         )
 
     BT = chunk_size
