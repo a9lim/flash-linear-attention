@@ -133,7 +133,7 @@ def chunk_precond_kda_fwd_kernel_inter_solve_fused(
         m_kc0 = m_k[:, None] & m_tc0[None, :]
         p_kp0 = k_precond + o_k[:, None] + o_c0[None, :] * (H*K)
         p_g0 = g + o_k[:, None] + o_c0[None, :] * (H*K)
-        b_kpt0 = tl.load(p_kp0, mask=m_kc0, other=0.0).to(tl.float32)  # k_precond transposed
+        b_kpt0 = tl.load(p_kp0, mask=m_kc0, other=0.0)  # k_precond transposed, storage dtype
         b_gt0 = tl.load(p_g0, mask=m_kc0, other=0.0).to(tl.float32)
 
         b_kpt1, b_gt1 = b_kpt0, b_gt0
@@ -147,9 +147,9 @@ def chunk_precond_kda_fwd_kernel_inter_solve_fused(
             p_kp1 = k_precond + o_c1[:, None] * (H*K) + o_k[None, :]
             p_g1 = g + o_c1[:, None] * (H*K) + o_k[None, :]
             # [BC, BK]
-            b_q1 = tl.load(p_q1, mask=m_c1k, other=0.0).to(tl.float32)
-            b_k1 = tl.load(p_k1, mask=m_c1k, other=0.0).to(tl.float32)  # Original k for row
-            b_kp1 = tl.load(p_kp1, mask=m_c1k, other=0.0).to(tl.float32)  # k_precond for column
+            b_q1 = tl.load(p_q1, mask=m_c1k, other=0.0)
+            b_k1 = tl.load(p_k1, mask=m_c1k, other=0.0)  # Original k for row
+            b_kp1 = tl.load(p_kp1, mask=m_c1k, other=0.0)  # k_precond for column
             b_g1 = tl.load(p_g1, mask=m_c1k, other=0.0).to(tl.float32)
             # [BK, BC]
             b_kpt1 = tl.trans(b_kp1)  # k_precond transposed
@@ -158,10 +158,10 @@ def chunk_precond_kda_fwd_kernel_inter_solve_fused(
             b_gn1 = tl.load(g + i_tc1 * H * K + o_k, mask=m_k, other=0).to(tl.float32)
             # [BC, BK]
             b_gqn1 = tl.where(m_tc1[:, None], exp2(b_g1 - b_gn1[None, :]), 0)
-            b_qg1 = b_q1 * b_gqn1
-            b_kg1 = b_k1 * b_gqn1  # Original k for Akk row
+            b_qg1 = (b_q1 * b_gqn1).to(b_q1.dtype)
+            b_kg1 = (b_k1 * b_gqn1).to(b_k1.dtype)  # Original k for Akk row
             # [BK, BC]
-            b_kpgt = b_kpt0 * exp2(b_gn1[:, None] - b_gt0)  # k_precond for column
+            b_kpgt = (b_kpt0 * exp2(b_gn1[:, None] - b_gt0)).to(b_kpt0.dtype)  # k_precond for column
             # [BC, BC]
             b_Aqk10 += tl.dot(b_qg1, b_kpgt)
             b_Akk10 += tl.dot(b_kg1, b_kpgt)  # Asymmetric: k @ k_precond^T
@@ -173,22 +173,22 @@ def chunk_precond_kda_fwd_kernel_inter_solve_fused(
             p_kp2 = k_precond + o_c2[:, None] * (H*K) + o_k[None, :]
             p_g2 = g + o_c2[:, None] * (H*K) + o_k[None, :]
 
-            b_q2 = tl.load(p_q2, mask=m_c2k, other=0.0).to(tl.float32)
-            b_k2 = tl.load(p_k2, mask=m_c2k, other=0.0).to(tl.float32)
-            b_kp2 = tl.load(p_kp2, mask=m_c2k, other=0.0).to(tl.float32)
+            b_q2 = tl.load(p_q2, mask=m_c2k, other=0.0)
+            b_k2 = tl.load(p_k2, mask=m_c2k, other=0.0)
+            b_kp2 = tl.load(p_kp2, mask=m_c2k, other=0.0)
             b_g2 = tl.load(p_g2, mask=m_c2k, other=0.0).to(tl.float32)
             b_kpt2 = tl.trans(b_kp2)
             b_gt2 = tl.trans(b_g2)
 
             b_gn2 = tl.load(g + i_tc2 * H * K + o_k, mask=m_k, other=0).to(tl.float32)
             b_gqn2 = tl.where(m_tc2[:, None], exp2(b_g2 - b_gn2[None, :]), 0)
-            b_qg2 = b_q2 * b_gqn2
-            b_kg2 = b_k2 * b_gqn2
-            b_kpgt = b_kpt0 * exp2(b_gn2[:, None] - b_gt0)
+            b_qg2 = (b_q2 * b_gqn2).to(b_q2.dtype)
+            b_kg2 = (b_k2 * b_gqn2).to(b_k2.dtype)
+            b_kpgt = (b_kpt0 * exp2(b_gn2[:, None] - b_gt0)).to(b_kpt0.dtype)
             b_Aqk20 += tl.dot(b_qg2, b_kpgt)
             b_Akk20 += tl.dot(b_kg2, b_kpgt)
 
-            b_kpgt = b_kpt1 * exp2(b_gn2[:, None] - b_gt1)
+            b_kpgt = (b_kpt1 * exp2(b_gn2[:, None] - b_gt1)).to(b_kpt1.dtype)
             b_Aqk21 += tl.dot(b_qg2, b_kpgt)
             b_Akk21 += tl.dot(b_kg2, b_kpgt)
 
@@ -197,23 +197,23 @@ def chunk_precond_kda_fwd_kernel_inter_solve_fused(
             p_q3 = q + o_c3[:, None] * (H*K) + o_k[None, :]
             p_k3 = k + o_c3[:, None] * (H*K) + o_k[None, :]
             p_g3 = g + o_c3[:, None] * (H*K) + o_k[None, :]
-            b_q3 = tl.load(p_q3, mask=m_c3k, other=0.0).to(tl.float32)
-            b_k3 = tl.load(p_k3, mask=m_c3k, other=0.0).to(tl.float32)
+            b_q3 = tl.load(p_q3, mask=m_c3k, other=0.0)
+            b_k3 = tl.load(p_k3, mask=m_c3k, other=0.0)
             b_g3 = tl.load(p_g3, mask=m_c3k, other=0.0).to(tl.float32)
 
             b_gn3 = tl.load(g + i_tc3 * H * K + o_k, mask=m_k, other=0).to(tl.float32)
             b_gqn3 = tl.where(m_tc3[:, None], exp2(b_g3 - b_gn3[None, :]), 0)
-            b_qg3 = b_q3 * b_gqn3
-            b_kg3 = b_k3 * b_gqn3
-            b_kpgt = b_kpt0 * exp2(b_gn3[:, None] - b_gt0)
+            b_qg3 = (b_q3 * b_gqn3).to(b_q3.dtype)
+            b_kg3 = (b_k3 * b_gqn3).to(b_k3.dtype)
+            b_kpgt = (b_kpt0 * exp2(b_gn3[:, None] - b_gt0)).to(b_kpt0.dtype)
             b_Aqk30 += tl.dot(b_qg3, b_kpgt)
             b_Akk30 += tl.dot(b_kg3, b_kpgt)
 
-            b_kpgt = b_kpt1 * exp2(b_gn3[:, None] - b_gt1)
+            b_kpgt = (b_kpt1 * exp2(b_gn3[:, None] - b_gt1)).to(b_kpt1.dtype)
             b_Aqk31 += tl.dot(b_qg3, b_kpgt)
             b_Akk31 += tl.dot(b_kg3, b_kpgt)
 
-            b_kpgt = b_kpt2 * exp2(b_gn3[:, None] - b_gt2)
+            b_kpgt = (b_kpt2 * exp2(b_gn3[:, None] - b_gt2)).to(b_kpt2.dtype)
             b_Aqk32 += tl.dot(b_qg3, b_kpgt)
             b_Akk32 += tl.dot(b_kg3, b_kpgt)
 
