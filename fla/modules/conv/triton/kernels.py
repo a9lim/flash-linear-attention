@@ -337,6 +337,193 @@ def causal_conv1d_bwd_kernel(
 
 
 @triton.heuristics({
+    'HAS_BIAS': lambda args: args['bias'] is not None,
+    'HAS_RESIDUAL': lambda args: args['residual'] is not None,
+})
+@fla_cache_autotune(
+    configs=[triton.Config({}, num_warps=num_warps) for num_warps in [2, 4, 8]],
+    key=['D', 'W', 'BD', 'NORM_D'],
+    **autotune_cache_kwargs,
+)
+@triton.jit
+def causal_conv1d_fwd_l2norm_kernel(
+    x,
+    y,
+    weight,
+    bias,
+    residual,
+    T,
+    stride_x_n,
+    stride_x_t,
+    stride_x_d,
+    D: tl.constexpr,
+    W: tl.constexpr,
+    BT: tl.constexpr,
+    BW: tl.constexpr,
+    BD: tl.constexpr,
+    NORM_D: tl.constexpr,
+    EPS: tl.constexpr,
+    ACTIVATION: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    HAS_RESIDUAL: tl.constexpr,
+):
+    """Dense fixed-length causal conv with the activation and a per-head L2 norm fused.
+
+    Every program owns one head (``BD`` channels) of ``BT`` rows; channels below
+    ``NORM_D`` are normalized over the head after the activation. No cache state.
+    """
+    i_d, i_t, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    bos = (i_b * T).to(tl.int64)
+    p_x = x + tl.cast(i_b, tl.int64) * stride_x_n
+
+    o_d = i_d * BD + tl.arange(0, BD)
+    o_t = i_t.to(tl.int64) * BT + tl.arange(0, BT)
+    o_w = tl.arange(0, BW) + W - BW
+    m_d = o_d < D
+    m_w = o_w >= 0
+    m_y = (o_t < T)[:, None] & m_d[None, :]
+
+    # [BD, BW]
+    b_w = tl.load(weight + o_d[:, None] * W + o_w, mask=m_d[:, None] & m_w, other=0).to(tl.float32)
+
+    b_y = tl.zeros((BT, BD), dtype=tl.float32)
+    for i_w in tl.static_range(-W + 1, 1):
+        o_x = o_t + i_w
+        p_yi = p_x + o_x[:, None] * stride_x_t + o_d[None, :] * stride_x_d
+        b_yi = tl.load(p_yi, mask=((o_x >= 0) & (o_x < T))[:, None] & m_d[None, :], other=0.0).to(tl.float32)
+        b_yi *= tl.sum(b_w * (o_w == (i_w + W - 1)), 1)
+        b_y += b_yi
+
+    if HAS_BIAS:
+        b_y += tl.load(bias + o_d, mask=m_d).to(tl.float32)
+
+    if ACTIVATION == 'swish' or ACTIVATION == 'silu':
+        b_y = b_y * tl.sigmoid(b_y)
+
+    if i_d * BD < NORM_D:
+        b_rstd = 1 / tl.sqrt(tl.sum(b_y * b_y, 1) + EPS)
+        b_y = b_y * b_rstd[:, None]
+
+    if HAS_RESIDUAL:
+        p_residual = residual + bos * D + o_t[:, None] * D + o_d[None, :]
+        b_y += tl.load(p_residual, mask=m_y, other=0.0)
+
+    p_y = y + bos * D + o_t[:, None] * D + o_d[None, :]
+    tl.store(p_y, tl.cast(b_y, dtype=p_y.dtype.element_ty, fp_downcast_rounding='rtne'), mask=m_y)
+
+
+@triton.heuristics({
+    'HAS_BIAS': lambda args: args['db'] is not None,
+})
+@fla_cache_autotune(
+    configs=[triton.Config({}, num_warps=num_warps) for num_warps in [2, 4, 8]],
+    key=['D', 'W', 'BD', 'NORM_D'],
+    **autotune_cache_kwargs,
+)
+@triton.jit
+def causal_conv1d_bwd_l2norm_kernel(
+    x,
+    weight,
+    bias,
+    dy,
+    dx,
+    dw,
+    db,
+    T,
+    stride_x_n,
+    stride_x_t,
+    stride_x_d,
+    stride_dx_n,
+    stride_dx_t,
+    stride_dx_d,
+    stride_dy_n,
+    stride_dy_t,
+    stride_dy_d,
+    D: tl.constexpr,
+    W: tl.constexpr,
+    BT: tl.constexpr,
+    BW: tl.constexpr,
+    BD: tl.constexpr,
+    NORM_D: tl.constexpr,
+    EPS: tl.constexpr,
+    ACTIVATION: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+):
+    """Backward of ``causal_conv1d_fwd_l2norm_kernel``.
+
+    The pre-activation output is recomputed in place from ``x`` for every shifted
+    row block (the taps come from L2), so no forward recompute launch and no
+    saved normalization statistics are needed.
+    """
+    i_d, i_t, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_tg = i_b * tl.num_programs(1) + i_t
+    p_x = x + tl.cast(i_b, tl.int64) * stride_x_n
+    p_dy = dy + tl.cast(i_b, tl.int64) * stride_dy_n
+
+    o_d = i_d * BD + tl.arange(0, BD)
+    o_t = i_t.to(tl.int64) * BT + tl.arange(0, BT)
+    o_w = tl.arange(0, BW) + W - BW
+    m_d = o_d < D
+    m_w = o_w >= 0
+    m_x = (o_t < T)[:, None] & m_d[None, :]
+
+    b_x = tl.load(p_x + o_t[:, None] * stride_x_t + o_d[None, :] * stride_x_d, mask=m_x, other=0.0)
+    # [BD, BW]
+    b_w = tl.load(weight + o_d[:, None] * W + o_w, mask=m_d[:, None] & m_w, other=0).to(tl.float32)
+    if HAS_BIAS:
+        b_bias = tl.load(bias + o_d, mask=m_d, other=0.0).to(tl.float32)
+        b_db = tl.zeros((BD,), dtype=tl.float32)
+
+    b_dx = tl.zeros((BT, BD), dtype=tl.float32)
+    for i_w in tl.static_range(0, W):
+        o_dy = o_t + i_w
+        m_dy = (o_dy < T)[:, None] & m_d[None, :]
+        b_dz = tl.load(p_dy + o_dy[:, None] * stride_dy_t + o_d[None, :] * stride_dy_d, mask=m_dy, other=0.0).to(tl.float32)
+
+        # recompute the pre-activation rows o_dy in the forward's tap order
+        b_y = tl.zeros((BT, BD), dtype=tl.float32)
+        for j_w in tl.static_range(-W + 1, 1):
+            o_x = o_dy + j_w
+            b_xi = tl.load(
+                p_x + o_x[:, None] * stride_x_t + o_d[None, :] * stride_x_d,
+                mask=((o_x >= 0) & (o_x < T))[:, None] & m_d[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            b_xi *= tl.sum(b_w * (o_w == (j_w + W - 1)), 1)
+            b_y += b_xi
+        if HAS_BIAS:
+            b_y += b_bias[None, :]
+
+        if ACTIVATION == 'swish' or ACTIVATION == 'silu':
+            b_ys = tl.sigmoid(b_y)
+            b_s = b_y * b_ys
+        else:
+            b_s = b_y
+
+        if i_d * BD < NORM_D:
+            b_rstd = 1 / tl.sqrt(tl.sum(b_s * b_s, 1) + EPS)
+            b_z = b_s * b_rstd[:, None]
+            b_dz = (b_dz - b_z * tl.sum(b_dz * b_z, 1)[:, None]) * b_rstd[:, None]
+
+        if ACTIVATION == 'swish' or ACTIVATION == 'silu':
+            b_dy = b_dz * b_ys * (1 + b_y * (1 - b_ys))
+        else:
+            b_dy = b_dz
+
+        b_dw = tl.sum(b_dy * b_x, 0)
+        tl.store(dw + i_tg * D*W + o_d * W + W - i_w - 1, b_dw.to(dw.dtype.element_ty), mask=m_d)
+        if HAS_BIAS and i_w == 0:
+            b_db += tl.sum(b_dy, 0)
+        b_dx += b_dy * tl.sum(b_w * (o_w == (W - i_w - 1)), 1)
+
+    if HAS_BIAS:
+        tl.store(db + i_tg * D + o_d, tl.cast(b_db, dtype=db.dtype.element_ty, fp_downcast_rounding='rtne'), mask=m_d)
+
+    p_dx = dx + tl.cast(i_b, tl.int64) * stride_dx_n + o_t[:, None] * stride_dx_t + o_d[None, :] * stride_dx_d
+    tl.store(p_dx, tl.cast(b_dx, dtype=p_dx.dtype.element_ty, fp_downcast_rounding='rtne'), mask=m_x)
+
+
+@triton.heuristics({
     'USE_INITIAL_STATE': lambda args: args['cache'] is not None,
     'HAS_WEIGHT': lambda args: args['weight'] is not None,
     'HAS_BIAS': lambda args: args['bias'] is not None,

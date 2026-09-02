@@ -15,7 +15,9 @@ from fla.utils import input_guard
 
 from .kernels import (
     causal_conv1d_bwd_kernel,
+    causal_conv1d_bwd_l2norm_kernel,
     causal_conv1d_fwd_kernel,
+    causal_conv1d_fwd_l2norm_kernel,
     causal_conv1d_states_fwd_kernel,
     causal_conv1d_update_kernel,
     compute_dh0_kernel,
@@ -30,6 +32,25 @@ def _has_non_standard_layout(x: torch.Tensor) -> bool:
         return not x.is_contiguous()
     _, stride_t, stride_d = x.stride()
     return stride_d == 1 and stride_t != x.shape[-1]
+
+
+def _l2norm_geometry(
+    D: int,
+    l2norm_head_dim: int,
+    l2norm_channels: int | None,
+    initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+) -> tuple[int, int]:
+    """Validate the fused conv+L2-norm request and return ``(BD, NORM_D)``."""
+    if initial_state is not None or cu_seqlens is not None:
+        raise ValueError("the fused conv+L2-norm path supports dense fixed-length inputs without cache state")
+    norm_d = D if l2norm_channels is None else l2norm_channels
+    if l2norm_head_dim & (l2norm_head_dim - 1) or D % l2norm_head_dim or norm_d % l2norm_head_dim:
+        raise ValueError(
+            f"l2norm_head_dim={l2norm_head_dim} must be a power of two dividing D={D} and "
+            f"l2norm_channels={norm_d}"
+        )
+    return l2norm_head_dim, norm_d
 
 
 @dispatch('modules')
@@ -47,6 +68,9 @@ def causal_conv1d_fwd(
     chunk_indices: torch.LongTensor | None = None,
     BT: int = 64,
     layout_fallback: bool = False,
+    l2norm_head_dim: int | None = None,
+    l2norm_channels: int | None = None,
+    l2norm_eps: float = 1e-6,
 ) -> torch.Tensor:
     shape = x.shape
     if x.shape[-1] != weight.shape[0]:
@@ -56,6 +80,32 @@ def causal_conv1d_fwd(
     stride_x_n, stride_x_t, stride_x_d = x.stride()
 
     BW = triton.next_power_of_2(W)
+    if l2norm_head_dim is not None:
+        if output_final_state:
+            raise ValueError("the fused conv+L2-norm path does not produce a final state")
+        BD, NORM_D = _l2norm_geometry(D, l2norm_head_dim, l2norm_channels, initial_state, cu_seqlens)
+        y = torch.empty_like(x, memory_format=torch.contiguous_format)
+        grid = (D // BD, triton.cdiv(T, BT), B)
+        causal_conv1d_fwd_l2norm_kernel[grid](
+            x=x,
+            y=y,
+            weight=weight,
+            bias=bias,
+            residual=residual,
+            T=T,
+            stride_x_n=stride_x_n,
+            stride_x_t=stride_x_t,
+            stride_x_d=stride_x_d,
+            D=D,
+            W=W,
+            BT=BT,
+            BW=BW,
+            BD=BD,
+            NORM_D=NORM_D,
+            EPS=l2norm_eps,
+            ACTIVATION=activation,
+        )
+        return y.view(shape), None
     if cu_seqlens is not None and chunk_indices is None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT, cu_seqlens_cpu=cu_seqlens_cpu)
     NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
@@ -158,6 +208,9 @@ def causal_conv1d_bwd(
     chunk_indices: torch.LongTensor | None = None,
     BT: int = 64,
     layout_fallback: bool = False,
+    l2norm_head_dim: int | None = None,
+    l2norm_channels: int | None = None,
+    l2norm_eps: float = 1e-6,
 ):
     shape = x.shape
     if x.shape[-1] != weight.shape[0]:
@@ -169,6 +222,48 @@ def causal_conv1d_bwd(
     stride_dy_n, stride_dy_t, stride_dy_d = dy.stride()
 
     BW = triton.next_power_of_2(W)
+    if l2norm_head_dim is not None:
+        if dht is not None:
+            raise ValueError("the fused conv+L2-norm path carries no final state")
+        BD, NORM_D = _l2norm_geometry(D, l2norm_head_dim, l2norm_channels, initial_state, cu_seqlens)
+        NT = triton.cdiv(T, BT)
+        dx = torch.empty_like(x)
+        dw = weight.new_empty(B*NT, *weight.shape, dtype=torch.float)
+        db = bias.new_empty(B*NT, *bias.shape, dtype=torch.float) if bias is not None else None
+        stride_dx_n, stride_dx_t, stride_dx_d = dx.stride()
+        grid = (D // BD, NT, B)
+        causal_conv1d_bwd_l2norm_kernel[grid](
+            x=x,
+            weight=weight,
+            bias=bias,
+            dy=dy,
+            dx=dx,
+            dw=dw,
+            db=db,
+            T=T,
+            stride_x_n=stride_x_n,
+            stride_x_t=stride_x_t,
+            stride_x_d=stride_x_d,
+            stride_dx_n=stride_dx_n,
+            stride_dx_t=stride_dx_t,
+            stride_dx_d=stride_dx_d,
+            stride_dy_n=stride_dy_n,
+            stride_dy_t=stride_dy_t,
+            stride_dy_d=stride_dy_d,
+            D=D,
+            W=W,
+            BT=BT,
+            BW=BW,
+            BD=BD,
+            NORM_D=NORM_D,
+            EPS=l2norm_eps,
+            ACTIVATION=activation,
+        )
+        dw = dw.sum(0).to(weight)
+        if db is not None:
+            db = db.sum(0).to(bias)
+        dr = dy if residual is not None else None
+        return dx.view(shape), dw, db, dr, None
     if cu_seqlens is not None and chunk_indices is None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT, cu_seqlens_cpu=cu_seqlens_cpu)
     NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
@@ -380,6 +475,9 @@ class CausalConv1dFunction(torch.autograd.Function):
         cu_seqlens_cpu: torch.LongTensor | None = None,
         chunk_indices: torch.LongTensor | None = None,
         chunk_size: int = 64,
+        l2norm_head_dim: int | None = None,
+        l2norm_channels: int | None = None,
+        l2norm_eps: float = 1e-6,
     ):
         BT = chunk_size
         if cu_seqlens is not None and chunk_indices is None:
@@ -389,6 +487,7 @@ class CausalConv1dFunction(torch.autograd.Function):
         ctx.cu_seqlens_cpu = cu_seqlens_cpu
         ctx.chunk_indices = chunk_indices
         ctx.layout_fallback = _has_non_standard_layout(x)
+        ctx.l2norm = (l2norm_head_dim, l2norm_channels, l2norm_eps)
         ctx.save_for_backward(x, weight, bias, residual, initial_state)
         y, final_state = causal_conv1d_fwd(
             x=x,
@@ -403,6 +502,9 @@ class CausalConv1dFunction(torch.autograd.Function):
             chunk_indices=chunk_indices,
             BT=BT,
             layout_fallback=ctx.layout_fallback,
+            l2norm_head_dim=l2norm_head_dim,
+            l2norm_channels=l2norm_channels,
+            l2norm_eps=l2norm_eps,
         )
         return y, final_state
 
@@ -410,6 +512,7 @@ class CausalConv1dFunction(torch.autograd.Function):
     @input_guard(no_guard_contiguous=["dy"])
     def backward(ctx, dy: torch.Tensor, dht: torch.Tensor | None = None):
         x, weight, bias, residual, initial_state = ctx.saved_tensors
+        l2norm_head_dim, l2norm_channels, l2norm_eps = ctx.l2norm
         dx, dw, db, dr, dh0 = causal_conv1d_bwd(
             x=x,
             dy=dy,
@@ -423,5 +526,8 @@ class CausalConv1dFunction(torch.autograd.Function):
             cu_seqlens_cpu=ctx.cu_seqlens_cpu,
             chunk_indices=ctx.chunk_indices,
             layout_fallback=ctx.layout_fallback,
+            l2norm_head_dim=l2norm_head_dim,
+            l2norm_channels=l2norm_channels,
+            l2norm_eps=l2norm_eps,
         )
-        return dx, dw, db, dr, dh0, None, None, None, None, None, None
+        return dx, dw, db, dr, dh0, None, None, None, None, None, None, None, None, None

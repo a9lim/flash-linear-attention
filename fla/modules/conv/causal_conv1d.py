@@ -27,6 +27,9 @@ def causal_conv1d(
     cu_seqlens_cpu: torch.LongTensor | None = None,
     chunk_indices: torch.LongTensor | None = None,
     cp_context: FLACPContext | None = None,
+    l2norm_head_dim: int | None = None,
+    l2norm_channels: int | None = None,
+    l2norm_eps: float = 1e-6,
     **kwargs,
 ):
     """
@@ -60,6 +63,15 @@ def causal_conv1d(
             Cumulative sequence lengths (optional)
         chunk_indices (Optional[torch.LongTensor]):
             Chunk indices for variable-length sequences (optional)
+        l2norm_head_dim (Optional[int]):
+            When set, the Triton backend fuses a per-head L2 normalization (heads of
+            this many channels, applied after the activation) into the convolution
+            for the first `l2norm_channels` channels (all channels by default).
+            Dense fixed-length training only: no cache state, no `cu_seqlens`.
+        l2norm_channels (Optional[int]):
+            Number of leading channels the fused L2 normalization covers.
+        l2norm_eps (float):
+            Epsilon inside the fused normalization's square root. Default: `1e-6`.
 
     Returns:
         Tuple of (output, final_state).
@@ -69,6 +81,9 @@ def causal_conv1d(
     from fla.modules.conv.cp import causal_conv1d_cp
     from fla.modules.conv.cuda import causal_conv1d_cuda, fast_causal_conv1d_fn
     from fla.modules.conv.triton import CausalConv1dFunction
+
+    if l2norm_head_dim is not None and (backend != 'triton' or cp_context is not None):
+        raise ValueError("the fused conv+L2-norm path is implemented by the triton backend only")
 
     if cp_context is not None:
         assert initial_state is None, "Initial state is not supported for CP"
@@ -95,6 +110,10 @@ def causal_conv1d(
             cu_seqlens,
             cu_seqlens_cpu,
             chunk_indices,
+            64,
+            l2norm_head_dim,
+            l2norm_channels,
+            l2norm_eps,
         )
         return y, final_state
     elif backend == 'mix':

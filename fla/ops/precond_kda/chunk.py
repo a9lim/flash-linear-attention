@@ -590,6 +590,7 @@ def chunk_precond_kda(
     solve_tril_precision: str | None = None,
     disable_recompute: bool = False,
     return_intermediate_states: bool = False,
+    use_qk_l2norm_in_kernel: bool = True,
     **kwargs,
 ):
     r"""
@@ -655,6 +656,10 @@ def chunk_precond_kda(
             If True, returns intermediate state `h` for inference scenarios (e.g., vLLM).
             Must be used within `torch.inference_mode()` and will return a 4-tuple instead of 3-tuple.
             This is not intended for training as it bypasses autograd. Default: `False`.
+        use_qk_l2norm_in_kernel (bool):
+            Whether to L2-normalize `q` and `k` inside the operator. Pass `False` when the
+            caller already normalized them (for example through the fused convolution).
+            Default: `True`.
         cp_context (Optional[FLACPContext]):
             Context parallelism is not yet supported for the preconditioned path;
             passing a context raises `NotImplementedError`. Default: `None`.
@@ -783,7 +788,7 @@ def chunk_precond_kda(
         initial_state,
         initial_A_state,
         output_final_state,
-        True,   # use_qk_l2norm_in_kernel (always True)
+        use_qk_l2norm_in_kernel,
         use_gate_in_kernel,
         A_log,
         dt_bias,
