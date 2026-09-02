@@ -30,6 +30,7 @@ def causal_conv1d(
     l2norm_head_dim: int | None = None,
     l2norm_channels: int | None = None,
     l2norm_eps: float = 1e-6,
+    split_outputs: tuple[int, ...] | None = None,
     **kwargs,
 ):
     """
@@ -72,9 +73,17 @@ def causal_conv1d(
             Number of leading channels the fused L2 normalization covers.
         l2norm_eps (float):
             Epsilon inside the fused normalization's square root. Default: `1e-6`.
+        split_outputs (Optional[tuple[int, ...]]):
+            Channel widths of separate outputs to write, in order. Each width must
+            be a positive multiple of `l2norm_head_dim` and they must sum to `D`.
+            The convolution then writes one contiguous `[B, T, w_i]` tensor per
+            width instead of a single `[B, T, D]` output, and its backward takes
+            one gradient per width. Requires the fused conv+L2-norm triton path
+            and no residual.
 
     Returns:
-        Tuple of (output, final_state).
+        Tuple of (output, final_state), where the output is a tuple of tensors
+        when `split_outputs` is given and a single tensor otherwise.
         If `output_final_state` is `False`, the final state is `None`.
     """
     # Import here to avoid circular dependencies
@@ -84,6 +93,8 @@ def causal_conv1d(
 
     if l2norm_head_dim is not None and (backend != 'triton' or cp_context is not None):
         raise ValueError("the fused conv+L2-norm path is implemented by the triton backend only")
+    if split_outputs is not None and l2norm_head_dim is None:
+        raise ValueError("split_outputs is implemented by the fused conv+L2-norm path only")
 
     if cp_context is not None:
         assert initial_state is None, "Initial state is not supported for CP"
@@ -99,7 +110,7 @@ def causal_conv1d(
         return output, None
 
     if backend == 'triton':
-        y, final_state = CausalConv1dFunction.apply(
+        out = CausalConv1dFunction.apply(
             x,
             weight,
             bias,
@@ -114,8 +125,11 @@ def causal_conv1d(
             l2norm_head_dim,
             l2norm_channels,
             l2norm_eps,
+            split_outputs,
         )
-        return y, final_state
+        if split_outputs is not None:
+            return out[:-1], out[-1]
+        return out[0], out[1]
     elif backend == 'mix':
         seq_idx = kwargs.get('seq_idx')
         return fast_causal_conv1d_fn(

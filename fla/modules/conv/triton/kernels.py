@@ -356,6 +356,8 @@ def causal_conv1d_fwd_l2norm_kernel(
     stride_x_n,
     stride_x_t,
     stride_x_d,
+    Y_OFF,
+    YD,
     D: tl.constexpr,
     W: tl.constexpr,
     BT: tl.constexpr,
@@ -371,12 +373,17 @@ def causal_conv1d_fwd_l2norm_kernel(
 
     Every program owns one head (``BD`` channels) of ``BT`` rows; channels below
     ``NORM_D`` are normalized over the head after the activation. No cache state.
+
+    ``y`` is a ``[B, T, YD]`` slab holding the input channels
+    ``[Y_OFF, Y_OFF + YD)``; the whole output is one slab with ``Y_OFF=0`` and
+    ``YD=D``.
     """
     i_d, i_t, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     bos = (i_b * T).to(tl.int64)
     p_x = x + tl.cast(i_b, tl.int64) * stride_x_n
 
-    o_d = i_d * BD + tl.arange(0, BD)
+    o_dl = i_d * BD + tl.arange(0, BD)
+    o_d = Y_OFF + o_dl
     o_t = i_t.to(tl.int64) * BT + tl.arange(0, BT)
     o_w = tl.arange(0, BW) + W - BW
     m_d = o_d < D
@@ -400,7 +407,7 @@ def causal_conv1d_fwd_l2norm_kernel(
     if ACTIVATION == 'swish' or ACTIVATION == 'silu':
         b_y = b_y * tl.sigmoid(b_y)
 
-    if i_d * BD < NORM_D:
+    if Y_OFF + i_d * BD < NORM_D:
         b_rstd = 1 / tl.sqrt(tl.sum(b_y * b_y, 1) + EPS)
         b_y = b_y * b_rstd[:, None]
 
@@ -408,7 +415,7 @@ def causal_conv1d_fwd_l2norm_kernel(
         p_residual = residual + bos * D + o_t[:, None] * D + o_d[None, :]
         b_y += tl.load(p_residual, mask=m_y, other=0.0)
 
-    p_y = y + bos * D + o_t[:, None] * D + o_d[None, :]
+    p_y = y + bos * YD + o_t[:, None] * YD + o_dl[None, :]
     tl.store(p_y, tl.cast(b_y, dtype=p_y.dtype.element_ty, fp_downcast_rounding='rtne'), mask=m_y)
 
 
@@ -439,6 +446,7 @@ def causal_conv1d_bwd_l2norm_kernel(
     stride_dy_n,
     stride_dy_t,
     stride_dy_d,
+    Y_OFF,
     D: tl.constexpr,
     W: tl.constexpr,
     BT: tl.constexpr,
@@ -451,6 +459,10 @@ def causal_conv1d_bwd_l2norm_kernel(
 ):
     """Backward of ``causal_conv1d_fwd_l2norm_kernel``.
 
+    ``dy`` is the gradient of one output slab covering input channels
+    ``[Y_OFF, Y_OFF + BD * num_programs(0))``; ``dx``, ``dw`` and ``db`` stay
+    full width.
+
     The pre-activation output is recomputed in place from ``x`` for every shifted
     row block (the taps come from L2), so no forward recompute launch and no
     saved normalization statistics are needed.
@@ -460,7 +472,8 @@ def causal_conv1d_bwd_l2norm_kernel(
     p_x = x + tl.cast(i_b, tl.int64) * stride_x_n
     p_dy = dy + tl.cast(i_b, tl.int64) * stride_dy_n
 
-    o_d = i_d * BD + tl.arange(0, BD)
+    o_dl = i_d * BD + tl.arange(0, BD)
+    o_d = Y_OFF + o_dl
     o_t = i_t.to(tl.int64) * BT + tl.arange(0, BT)
     o_w = tl.arange(0, BW) + W - BW
     m_d = o_d < D
@@ -478,7 +491,7 @@ def causal_conv1d_bwd_l2norm_kernel(
     for i_w in tl.static_range(0, W):
         o_dy = o_t + i_w
         m_dy = (o_dy < T)[:, None] & m_d[None, :]
-        b_dz = tl.load(p_dy + o_dy[:, None] * stride_dy_t + o_d[None, :] * stride_dy_d, mask=m_dy, other=0.0).to(tl.float32)
+        b_dz = tl.load(p_dy + o_dy[:, None] * stride_dy_t + o_dl[None, :] * stride_dy_d, mask=m_dy, other=0.0).to(tl.float32)
 
         # recompute the pre-activation rows o_dy in the forward's tap order
         b_y = tl.zeros((BT, BD), dtype=tl.float32)
@@ -500,7 +513,7 @@ def causal_conv1d_bwd_l2norm_kernel(
         else:
             b_s = b_y
 
-        if i_d * BD < NORM_D:
+        if Y_OFF + i_d * BD < NORM_D:
             b_rstd = 1 / tl.sqrt(tl.sum(b_s * b_s, 1) + EPS)
             b_z = b_s * b_rstd[:, None]
             b_dz = (b_dz - b_z * tl.sum(b_dz * b_z, 1)[:, None]) * b_rstd[:, None]
