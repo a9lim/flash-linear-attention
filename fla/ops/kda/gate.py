@@ -168,7 +168,7 @@ def kda_gate_fwd_kernel(
         for num_warps in NUM_WARPS_AUTOTUNE
         for num_stages in [2, 3]
     ],
-    key=["H", "D"],
+    key=["H", "D", "BT", "REVERSE_CUMSUM"],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -192,6 +192,7 @@ def kda_gate_bwd_kernel(
     HAS_BIAS: tl.constexpr,
     HAS_BETA: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
+    REVERSE_CUMSUM: tl.constexpr,
 ):
     i_t, i_h = tl.program_id(0).to(tl.int64), tl.program_id(1)
 
@@ -208,6 +209,10 @@ def kda_gate_bwd_kernel(
     # [BT, BD]
     b_g = tl.load(p_g, mask=m_g, other=0.0).to(tl.float32)
     b_dyg = tl.load(p_dyg, mask=m_g, other=0.0).to(tl.float32)
+    if REVERSE_CUMSUM:
+        # The row tile is one gate chunk, so the chunk-local reverse cumsum the
+        # caller would otherwise run over dyg happens here, in registers.
+        b_dyg = tl.cumsum(b_dyg, axis=0, reverse=True)
 
     if HAS_BIAS:
         o_b = i_h * D + tl.arange(0, BD)
@@ -283,13 +288,21 @@ def kda_gate_bwd(
     dt_bias: torch.Tensor | None = None,
     dyg: torch.Tensor | None = None,
     lower_bound: float | None = None,
+    reverse_cumsum_chunk_size: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Backward of the fused KDA gate.
+
+    ``reverse_cumsum_chunk_size`` folds the chunk-local reverse cumsum of
+    ``dyg`` into this kernel: pass the chunk size when ``dyg`` is still the raw
+    per-position gradient, and make sure every sequence length is a multiple of
+    it so a row tile never straddles two sequences.
+    """
     H, K = g.shape[-2:]
     T = g.numel() // (H * K)
-    BT = 32
+    BT = reverse_cumsum_chunk_size if reverse_cumsum_chunk_size is not None else 32
     NT = triton.cdiv(T, BT)
 
-    dg = torch.empty_like(g, dtype=torch.float32)
+    dg = torch.empty_like(g)
     dA = g.new_empty(NT, H, dtype=torch.float32) if A_log is not None else None
 
     grid = (triton.cdiv(T, BT), H)
@@ -309,9 +322,9 @@ def kda_gate_bwd(
         BT=BT,
         BD=triton.next_power_of_2(K),
         lower_bound=lower_bound,
+        REVERSE_CUMSUM=reverse_cumsum_chunk_size is not None,
     )
 
-    dg = dg.view_as(g).type_as(g)
     dA = dA.sum(0).view_as(A_log).type_as(A_log) if A_log is not None else None
     dbias = dg.view(-1, H * K).sum(0).to(dt_bias) if dt_bias is not None else None
 

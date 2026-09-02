@@ -157,6 +157,7 @@ def chunk_precond_kda_bwd(
     transpose_state_layout: bool = False,
     safe_gate: bool = False,
     disable_recompute: bool = False,
+    defer_dg_cumsum: bool = False,
     w: torch.Tensor | None = None,
     u: torch.Tensor | None = None,
     kg: torch.Tensor | None = None,
@@ -298,6 +299,7 @@ def chunk_precond_kda_bwd(
         chunk_indices=chunk_indices,
         chunk_size=chunk_size,
         safe_gate=safe_gate,
+        defer_reverse_cumsum=defer_dg_cumsum,
     )
 
     dk_precond_total = dk_precond2
@@ -474,6 +476,11 @@ class ChunkPrecondKDAFunction(torch.autograd.Function):
                 lower_bound=ctx.lower_bound,
             )
 
+        # The gate backward can absorb dg's chunk-local reverse cumsum when it
+        # runs at all and its row tiles cannot straddle two sequences; with it
+        # on, the dg that comes back from chunk_precond_kda_bwd is raw.
+        defer_dg_cumsum = ctx.use_gate_in_kernel and cu_seqlens is None and q.shape[1] % ctx.chunk_size == 0
+
         dq, dk, dv, dg, dg_atk, dbeta_atk, dbeta, d_log_atk_scale, dh0, dh0_atk = chunk_precond_kda_bwd(
             q=q,
             k=k,
@@ -499,6 +506,7 @@ class ChunkPrecondKDAFunction(torch.autograd.Function):
             transpose_state_layout=ctx.transpose_state_layout,
             safe_gate=ctx.safe_gate,
             disable_recompute=ctx.disable_recompute,
+            defer_dg_cumsum=defer_dg_cumsum,
             w=w,
             u=u,
             kg=kg,
@@ -520,6 +528,7 @@ class ChunkPrecondKDAFunction(torch.autograd.Function):
                 dt_bias=dt_bias,
                 dyg=dg,
                 lower_bound=ctx.lower_bound,
+                reverse_cumsum_chunk_size=ctx.chunk_size if defer_dg_cumsum else None,
             )
             dA_log = dA_log.to(A_log)
             if dt_bias is not None:

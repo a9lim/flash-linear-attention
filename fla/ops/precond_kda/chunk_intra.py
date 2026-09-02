@@ -964,9 +964,13 @@ def chunk_precond_kda_bwd_intra(
     chunk_indices: torch.LongTensor | None = None,
     chunk_size: int = 64,
     safe_gate: bool = False,
+    defer_reverse_cumsum: bool = False,
 ):
     """
     Asymmetric intra backward for preconditioned KDA.
+
+    With ``defer_reverse_cumsum`` the returned ``dg`` is the raw per-position
+    gradient; the chunk-local reverse cumsum is the caller's to apply.
     """
     B, T, H, K = k.shape
     BT = chunk_size
@@ -1018,12 +1022,16 @@ def chunk_precond_kda_bwd_intra(
     dk = dk2
     dk_precond = dk_precond2
     db = db2.sum(0).add_(db)
-    dg = chunk_local_cumsum(
-        dg2,
-        chunk_size=chunk_size,
-        reverse=True,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-    )
+    if defer_reverse_cumsum:
+        # The caller folds the chunk-local reverse cumsum into its own kernel.
+        dg = dg2
+    else:
+        dg = chunk_local_cumsum(
+            dg2,
+            chunk_size=chunk_size,
+            reverse=True,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+        )
 
     return dq, dk, dk_precond, db, dg
