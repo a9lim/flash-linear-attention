@@ -295,6 +295,7 @@ def _atk_backward_chunk_summary(
     k, log_g, beta,    # inputs for recompute
     ga, gsa,           # grads from scan-backward
     gk_out, gg_out, gbeta_out,
+    dk_out,            # [B, T, H, D] in k.dtype - final dk (aliases gk_out unless FUSE_DK)
     cu_seqlens,        # *i32 [N+1] - cumulative sequence lengths
     chunk_indices,     # *i32 [NT, 2] - (seq_idx, chunk_idx) pairs
     B: tl.constexpr, T, H: tl.constexpr, D: tl.constexpr,
@@ -308,6 +309,7 @@ def _atk_backward_chunk_summary(
     gg_stride_b, gg_stride_t, gg_stride_h,
     gbeta_stride_b, gbeta_stride_t, gbeta_stride_h,
     BK: tl.constexpr,
+    FUSE_DK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
     i_t = tl.program_id(0)
@@ -361,12 +363,15 @@ def _atk_backward_chunk_summary(
         mask_D = D_range < D
 
         if IS_VARLEN:
-            k_ptr = k + (bos + T_range)[:, None] * k_stride_t + h * k_stride_h + D_range[None, :] * k_stride_d
-            gk_ptr = gk_out + (bos + T_range)[:, None] * gk_stride_t + h * gk_stride_h + D_range[None, :] * gk_stride_d
+            k_off = (bos + T_range)[:, None] * k_stride_t + h * k_stride_h + D_range[None, :] * k_stride_d
+            gk_off = (bos + T_range)[:, None] * gk_stride_t + h * gk_stride_h + D_range[None, :] * gk_stride_d
         else:
-            k_ptr = k + b * k_stride_b + T_range[:, None] * k_stride_t + h * k_stride_h + D_range[None, :] * k_stride_d
-            gk_ptr = gk_out + b * gk_stride_b + T_range[:, None] * \
-                gk_stride_t + h * gk_stride_h + D_range[None, :] * gk_stride_d
+            k_off = b * k_stride_b + T_range[:, None] * k_stride_t + h * k_stride_h + D_range[None, :] * k_stride_d
+            gk_off = b * gk_stride_b + T_range[:, None] * gk_stride_t + h * gk_stride_h + \
+                D_range[None, :] * gk_stride_d
+        k_ptr = k + k_off
+        gk_ptr = gk_out + gk_off
+        dk_ptr = dk_out + gk_off
 
         ga_ptr = ga + i_n * ga_stride_b + h * ga_stride_h + chunk_id * ga_stride_c + (ga_stride_d) * D_range
 
@@ -385,11 +390,15 @@ def _atk_backward_chunk_summary(
         gk_val = gk_sq * k_val * 2
 
         # Every (sequence, head, chunk, k-tile) is owned by exactly one program
-        # here and in the chunk-out kernel that wrote the buffer, so the
-        # accumulation is a plain, deterministic read-add-write.
+        # here and in the chunk-out kernel that wrote the fp32 buffer, so the
+        # accumulation is a plain, deterministic read-add-write. With FUSE_DK the
+        # intra backward's dk is folded in here too and the total lands in
+        # k.dtype, so no separate mixed-dtype add or narrowing cast is needed.
         mask_TD = mask_T[:, None] * mask_D[None, :]
         gk_val += tl.load(gk_ptr, mask=mask_TD, other=0.0)
-        tl.store(gk_ptr, gk_val, mask=mask_TD)
+        if FUSE_DK:
+            gk_val += tl.load(dk_ptr, mask=mask_TD, other=0.0).to(tl.float32)
+        tl.store(dk_ptr, gk_val.to(dk_out.dtype.element_ty), mask=mask_TD)
 
     gdecays_exp = decays * gdecays
 
@@ -426,6 +435,7 @@ def chunk_atk_bwd(
     eps: float = 1e-6,
     log_atk_scale: torch.Tensor = None,
     dat: torch.Tensor | None = None,
+    dk_intra: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     r"""
     ATK backward pass. Takes precomputed forward intermediates from ``recompute_atk_fwd``.
@@ -445,9 +455,13 @@ def chunk_atk_bwd(
         eps: Epsilon for numerical stability.
         log_atk_scale: Per-head log-space center ``[H]``.
         dat: Incoming gradient w.r.t. the final ATK state ``[N, H, K]`` or ``None``.
+        dk_intra: Caller-owned ``[B, T, H, K]`` buffer in ``k.dtype`` holding the
+            non-ATK part of dk. When given it is accumulated into in place and
+            returned as the total, so the caller needs no separate add or cast.
 
     Returns:
-        dk_atk: Gradient contribution to k ``[B, T, H, K]``.
+        dk_atk: Gradient contribution to k ``[B, T, H, K]`` (the total when
+            ``dk_intra`` is given), fp32 otherwise.
         dbeta_atk: Gradient for beta ``[B, T, H]``.
         dg_atk: Gradient for g ``[B, T, H]``.
         d_log_atk_scale: Gradient for log_atk_scale ``[H]``.
@@ -476,7 +490,10 @@ def chunk_atk_bwd(
 
     logx = math.log(x) if x > 0 else 0.0
 
-    gk = torch.zeros_like(k, dtype=torch.float32)
+    # Scratch for the local backward; every in-range element is written there.
+    gk = torch.empty_like(k, dtype=torch.float32)
+    fuse_dk = dk_intra is not None
+    dk_out = dk_intra if fuse_dk else gk
     g_log_atk_scale = torch.zeros(H, device=k.device, dtype=torch.float32)
     gg = torch.zeros_like(g_raw, dtype=torch.float32)
     gbeta = torch.zeros_like(beta, dtype=torch.float32)
@@ -544,6 +561,7 @@ def chunk_atk_bwd(
         k, g_raw, beta,
         ga, gsa,
         gk, gg, gbeta,
+        dk_out,
         cu_seqlens, chunk_indices,
         B, T, H, K, CHUNK_LEN,
         k.stride(0), k.stride(1), k.stride(2), k.stride(3),
@@ -554,7 +572,7 @@ def chunk_atk_bwd(
         gk.stride(0), gk.stride(1), gk.stride(2), gk.stride(3),
         gg.stride(0), gg.stride(1), gg.stride(2),
         gbeta.stride(0), gbeta.stride(1), gbeta.stride(2),
-        BK, num_warps=4
+        BK, FUSE_DK=fuse_dk, num_warps=4
     )
 
-    return gk, gbeta, gg, g_log_atk_scale, dh0
+    return dk_out, gbeta, gg, g_log_atk_scale, dh0

@@ -295,9 +295,10 @@ def chunk_precond_kda_bwd(
     )
 
     dk_precond_total = dk_precond2
-    dk = dk_intra
 
-    dk_atk, dbeta_atk_grad, dg_atk, d_log_atk_scale, dh0_atk = chunk_atk_bwd(
+    # The ATK summary kernel folds the intra backward's dk into its own output,
+    # so `dk_total` comes back already in k.dtype with a single rounding.
+    dk_total, dbeta_atk_grad, dg_atk, d_log_atk_scale, dh0_atk = chunk_atk_bwd(
         k=k,
         g_raw=g_atk,
         beta=beta_atk,
@@ -311,10 +312,8 @@ def chunk_precond_kda_bwd(
         eps=eps,
         log_atk_scale=log_atk_scale,
         dat=dat,
+        dk_intra=dk_intra,
     )
-
-    # Combine dk gradients
-    dk_total = dk + dk_atk
 
     # dg3 from asymmetric intra backward already has reverse cumsum applied
     dg_total = dg3
