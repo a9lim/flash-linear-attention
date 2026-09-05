@@ -520,7 +520,8 @@ def causal_conv1d_bwd_l2norm_kernel(
 
     The nonlinear derivative is recomputed once for the input tile and its
     output halo, then reused across convolution taps. No forward statistics
-    or additional kernel launch are needed.
+    or additional kernel launch are needed. Heads narrower than 32 channels
+    use per-tap recomputation because Triton cannot lower their halo gathers.
     """
     i_d, i_t, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_tg = i_b * tl.num_programs(1) + i_t
@@ -545,33 +546,8 @@ def causal_conv1d_bwd_l2norm_kernel(
     if not HAS_BIAS:
         b_bias = tl.full((BD,), 0, dtype=tl.float32)
     normalize = Y_OFF + i_d * BD < NORM_D
-    b_derivative = _causal_conv1d_l2norm_derivative(
-        p_x=p_x,
-        p_dy=p_dy,
-        b_w=b_w,
-        b_bias=b_bias,
-        o_w=o_w,
-        o_d=o_d,
-        o_dl=o_dl,
-        o_dy=o_t,
-        normalize=normalize,
-        T=T,
-        stride_x_t=stride_x_t,
-        stride_x_d=stride_x_d,
-        stride_dy_t=stride_dy_t,
-        stride_dy_d=stride_dy_d,
-        D=D,
-        W=W,
-        BD=BD,
-        EPS=EPS,
-        ACTIVATION=ACTIVATION,
-        HAS_BIAS=HAS_BIAS,
-    )
-    if W > 1:
-        # four rows also keep one- and two-row gathers out of Triton's unsupported layout conversion
-        BH: tl.constexpr = 4 if W <= 4 else triton.next_power_of_2(W - 1)
-        o_halo = i_t.to(tl.int64) * BT + BT + tl.arange(0, BH)
-        b_halo = _causal_conv1d_l2norm_derivative(
+    if BD >= 32:
+        b_derivative = _causal_conv1d_l2norm_derivative(
             p_x=p_x,
             p_dy=p_dy,
             b_w=b_w,
@@ -579,7 +555,7 @@ def causal_conv1d_bwd_l2norm_kernel(
             o_w=o_w,
             o_d=o_d,
             o_dl=o_dl,
-            o_dy=o_halo,
+            o_dy=o_t,
             normalize=normalize,
             T=T,
             stride_x_t=stride_x_t,
@@ -593,15 +569,66 @@ def causal_conv1d_bwd_l2norm_kernel(
             ACTIVATION=ACTIVATION,
             HAS_BIAS=HAS_BIAS,
         )
+        if W > 1:
+            # four rows also keep one- and two-row gathers out of Triton's unsupported layout conversion
+            BH: tl.constexpr = 4 if W <= 4 else triton.next_power_of_2(W - 1)
+            o_halo = i_t.to(tl.int64) * BT + BT + tl.arange(0, BH)
+            b_halo = _causal_conv1d_l2norm_derivative(
+                p_x=p_x,
+                p_dy=p_dy,
+                b_w=b_w,
+                b_bias=b_bias,
+                o_w=o_w,
+                o_d=o_d,
+                o_dl=o_dl,
+                o_dy=o_halo,
+                normalize=normalize,
+                T=T,
+                stride_x_t=stride_x_t,
+                stride_x_d=stride_x_d,
+                stride_dy_t=stride_dy_t,
+                stride_dy_d=stride_dy_d,
+                D=D,
+                W=W,
+                BD=BD,
+                EPS=EPS,
+                ACTIVATION=ACTIVATION,
+                HAS_BIAS=HAS_BIAS,
+            )
 
     b_dx = tl.zeros((BT, BD), dtype=tl.float32)
     for i_w in tl.static_range(0, W):
-        o_shift = tl.arange(0, BT) + i_w
-        b_dy = tl.gather(b_derivative, tl.broadcast_to((o_shift % BT)[:, None], (BT, BD)), axis=0)
-        if i_w > 0:
-            o_tail = tl.maximum(o_shift - BT, 0)
-            b_tail = tl.gather(b_halo, tl.broadcast_to(o_tail[:, None], (BT, BD)), axis=0)
-            b_dy = tl.where((o_shift < BT)[:, None], b_dy, b_tail)
+        if BD >= 32:
+            o_shift = tl.arange(0, BT) + i_w
+            b_dy = tl.gather(b_derivative, tl.broadcast_to((o_shift % BT)[:, None], (BT, BD)), axis=0)
+            if i_w > 0:
+                o_tail = tl.maximum(o_shift - BT, 0)
+                b_tail = tl.gather(b_halo, tl.broadcast_to(o_tail[:, None], (BT, BD)), axis=0)
+                b_dy = tl.where((o_shift < BT)[:, None], b_dy, b_tail)
+        else:
+            # Narrow heads cannot lower the compact halo gather in Triton.
+            b_dy = _causal_conv1d_l2norm_derivative(
+                p_x=p_x,
+                p_dy=p_dy,
+                b_w=b_w,
+                b_bias=b_bias,
+                o_w=o_w,
+                o_d=o_d,
+                o_dl=o_dl,
+                o_dy=o_t + i_w,
+                normalize=normalize,
+                T=T,
+                stride_x_t=stride_x_t,
+                stride_x_d=stride_x_d,
+                stride_dy_t=stride_dy_t,
+                stride_dy_d=stride_dy_d,
+                D=D,
+                W=W,
+                BD=BD,
+                EPS=EPS,
+                ACTIVATION=ACTIVATION,
+                HAS_BIAS=HAS_BIAS,
+            )
 
         b_dw = tl.sum(b_dy * b_x, 0)
         tl.store(dw + i_tg * D*W + o_d * W + W - i_w - 1, b_dw.to(dw.dtype.element_ty), mask=m_d)
