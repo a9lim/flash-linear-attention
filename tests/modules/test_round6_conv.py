@@ -42,6 +42,8 @@ def _reference(x, weight, bias, residual, head_dim, norm_channels, activation):
         pytest.param(1, 31, 3, 64, 2, torch.float16, 'swish', True, True, False, True, 2, id='fp16_partial'),
         pytest.param(2, 63, 3, 128, 4, torch.bfloat16, 'silu', True, True, False, False, 2, id='partial_63'),
         pytest.param(1, 65, 3, 128, 4, torch.bfloat16, 'silu', False, True, False, True, 2, id='partial_65_strided'),
+        pytest.param(1, 65, 3, 8, 4, torch.bfloat16, 'silu', True, True, False, True, 2, id='small_head_8_tail'),
+        pytest.param(1, 65, 3, 16, 4, torch.bfloat16, 'silu', True, True, False, True, 2, id='small_head_16_tail'),
         pytest.param(2, 127, 3, 64, 7, torch.float32, None, True, False, True, True, 3, id='residual_fp32'),
         pytest.param(1, 129, 3, 64, 3, torch.bfloat16, 'silu', True, False, False, True, 0, id='no_normalized_channels'),
         pytest.param(4, 1024, 30, 128, 4, torch.bfloat16, 'silu', True, True, False, False, 20, id='production_three_slabs'),
@@ -84,6 +86,27 @@ def test_causal_conv1d_l2norm(B, T, H, HD, W, dtype, activation, bias, split, re
     names = ['dx', 'dw'] + (['db'] if bias else []) + (['dr'] if residual else [])
     for name, expected, result in zip(names, reference_gradients, gradients, strict=True):
         assert_close(name, expected.to(result), result, 0.006)
+
+
+def test_causal_conv1d_l2norm_scalar_head_finite():
+    # Head width one is accepted by the public power-of-two geometry contract.
+    torch.manual_seed(42)
+    x = torch.randn(1, 65, 3, device=device, dtype=torch.bfloat16).requires_grad_()
+    weight = (torch.randn(3, 4, device=device, dtype=torch.float32) * 0.2).requires_grad_()
+    bias = torch.randn(3, device=device, dtype=torch.float32).requires_grad_()
+    outputs, state = causal_conv1d(
+        x=x,
+        weight=weight,
+        bias=bias,
+        activation='silu',
+        l2norm_head_dim=1,
+        l2norm_channels=2,
+        split_outputs=(1, 1, 1),
+    )
+    assert state is None
+    gradients = torch.autograd.grad(outputs, (x, weight, bias), tuple(torch.randn_like(y) for y in outputs))
+    for tensor in (*outputs, *gradients):
+        assert torch.isfinite(tensor).all()
 
 
 @pytest.mark.parametrize('invalid', ['cache', 'varlen', 'final_state', 'split_residual', 'head_width'])
