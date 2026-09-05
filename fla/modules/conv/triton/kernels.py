@@ -463,9 +463,9 @@ def causal_conv1d_bwd_l2norm_kernel(
     ``[Y_OFF, Y_OFF + BD * num_programs(0))``; ``dx``, ``dw`` and ``db`` stay
     full width.
 
-    The pre-activation output is recomputed in place from ``x`` for every shifted
-    row block (the taps come from L2), so no forward recompute launch and no
-    saved normalization statistics are needed.
+    The nonlinear derivative is recomputed once for the input tile and its
+    output halo, then reused across convolution taps. No forward statistics
+    or additional kernel launch are needed.
     """
     i_d, i_t, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_tg = i_b * tl.num_programs(1) + i_t
@@ -487,41 +487,44 @@ def causal_conv1d_bwd_l2norm_kernel(
         b_bias = tl.load(bias + o_d, mask=m_d, other=0.0).to(tl.float32)
         b_db = tl.zeros((BD,), dtype=tl.float32)
 
+    BTH: tl.constexpr = triton.next_power_of_2(BT + W - 1)
+    o_dy = i_t.to(tl.int64) * BT + tl.arange(0, BTH)
+    m_dy = (o_dy < T)[:, None] & m_d[None, :]
+    b_dz = tl.load(p_dy + o_dy[:, None] * stride_dy_t + o_dl[None, :] * stride_dy_d, mask=m_dy, other=0.0).to(tl.float32)
+
+    b_y = tl.zeros((BTH, BD), dtype=tl.float32)
+    for j_w in tl.static_range(-W + 1, 1):
+        o_x = o_dy + j_w
+        b_xi = tl.load(
+            p_x + o_x[:, None] * stride_x_t + o_d[None, :] * stride_x_d,
+            mask=((o_x >= 0) & (o_x < T))[:, None] & m_d[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        b_xi *= tl.sum(b_w * (o_w == (j_w + W - 1)), 1)
+        b_y += b_xi
+    if HAS_BIAS:
+        b_y += b_bias[None, :]
+
+    if ACTIVATION == 'swish' or ACTIVATION == 'silu':
+        b_ys = tl.sigmoid(b_y)
+        b_s = b_y * b_ys
+    else:
+        b_s = b_y
+
+    if Y_OFF + i_d * BD < NORM_D:
+        b_rstd = 1 / tl.sqrt(tl.sum(b_s * b_s, 1) + EPS)
+        b_z = b_s * b_rstd[:, None]
+        b_dz = (b_dz - b_z * tl.sum(b_dz * b_z, 1)[:, None]) * b_rstd[:, None]
+
+    if ACTIVATION == 'swish' or ACTIVATION == 'silu':
+        b_derivative = b_dz * b_ys * (1 + b_y * (1 - b_ys))
+    else:
+        b_derivative = b_dz
+
     b_dx = tl.zeros((BT, BD), dtype=tl.float32)
     for i_w in tl.static_range(0, W):
-        o_dy = o_t + i_w
-        m_dy = (o_dy < T)[:, None] & m_d[None, :]
-        b_dz = tl.load(p_dy + o_dy[:, None] * stride_dy_t + o_dl[None, :] * stride_dy_d, mask=m_dy, other=0.0).to(tl.float32)
-
-        # recompute the pre-activation rows o_dy in the forward's tap order
-        b_y = tl.zeros((BT, BD), dtype=tl.float32)
-        for j_w in tl.static_range(-W + 1, 1):
-            o_x = o_dy + j_w
-            b_xi = tl.load(
-                p_x + o_x[:, None] * stride_x_t + o_d[None, :] * stride_x_d,
-                mask=((o_x >= 0) & (o_x < T))[:, None] & m_d[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            b_xi *= tl.sum(b_w * (o_w == (j_w + W - 1)), 1)
-            b_y += b_xi
-        if HAS_BIAS:
-            b_y += b_bias[None, :]
-
-        if ACTIVATION == 'swish' or ACTIVATION == 'silu':
-            b_ys = tl.sigmoid(b_y)
-            b_s = b_y * b_ys
-        else:
-            b_s = b_y
-
-        if Y_OFF + i_d * BD < NORM_D:
-            b_rstd = 1 / tl.sqrt(tl.sum(b_s * b_s, 1) + EPS)
-            b_z = b_s * b_rstd[:, None]
-            b_dz = (b_dz - b_z * tl.sum(b_dz * b_z, 1)[:, None]) * b_rstd[:, None]
-
-        if ACTIVATION == 'swish' or ACTIVATION == 'silu':
-            b_dy = b_dz * b_ys * (1 + b_y * (1 - b_ys))
-        else:
-            b_dy = b_dz
+        o_shift = tl.broadcast_to((tl.arange(0, BT) + i_w)[:, None], (BT, BD))
+        b_dy = tl.gather(b_derivative, o_shift, axis=0)
 
         b_dw = tl.sum(b_dy * b_x, 0)
         tl.store(dw + i_tg * D*W + o_d * W + W - i_w - 1, b_dw.to(dw.dtype.element_ty), mask=m_d)
