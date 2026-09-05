@@ -796,9 +796,9 @@ def chunk_precond_kda_bwd_kernel_intra(
         b_dq2 += tl.dot(b_dAqk_diag_qk, b_kp_exp_diag_qk) * exp_b_g_diag_qk
         b_dk2 += tl.dot(b_dAkk_diag_qk, b_kp_exp_diag_qk) * exp_b_g_diag_qk
     else:
-        # process four direct gate differences together; no separated exponent can overflow
-        o_diag_j = tl.arange(0, 4)
-        for j_start in range(0, min(BC, T - i_t * BT - i_i * BC), 4):
+        # process two direct gate differences together; no separated exponent can overflow
+        o_diag_j = tl.arange(0, 2)
+        for j_start in range(0, min(BC, T - i_t * BT - i_i * BC), 2):
             j = j_start + o_diag_j
             m_diag_j = (j < BC) & (i_ti + j < T)
             b_dAqk_val = tl.load(dAqk + o_dA[:, None] + j[None, :], mask=m_dA[:, None] & m_diag_j[None, :], other=0).to(tl.float32)
@@ -907,8 +907,8 @@ def chunk_precond_kda_bwd_kernel_intra(
         p_gkj_t = g + i_ti * H*K + o_k
         p_bj = beta + i_ti * H
 
-        o_diag_j = tl.arange(0, 4)
-        for j_start in range(0, min(BC, T - i_t * BT - i_i * BC), 4):
+        o_diag_j = tl.arange(0, 2)
+        for j_start in range(0, min(BC, T - i_t * BT - i_i * BC), 2):
             j = j_start + o_diag_j
             m_diag_j = (j < BC) & (i_ti + j < T)
             b_dAqk_t = tl.load(dAqk + o_dA_t[:, None] + j[None, :] * H*BT, mask=m_ti[:, None] & m_diag_j[None, :], other=0).to(tl.float32)
