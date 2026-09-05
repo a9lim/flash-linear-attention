@@ -5,7 +5,7 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
-"""Compare guarded intra backward with a frozen Git version on identical inputs."""
+"""Compare intra backward with a frozen Git version on identical inputs."""
 
 import argparse
 import importlib.util
@@ -120,7 +120,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix='round6_intra_') as directory:
         baseline = load_baseline(args.base, directory)
         result = {'regime': args.regime, 'errors': compare(baseline, values, enforce=not args.measure_drift)}
-        result['fast_fraction'] = {str(block): coverage(values, block) for block in (16, 32)}
+        result['bounded_span_fraction'] = {str(block): coverage(values, block) for block in (16, 32)}
         if not args.parity_only:
             # alternate complete captured calls; both include dbeta reduction
             times = {'baseline': [], 'candidate': []}

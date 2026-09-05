@@ -668,7 +668,6 @@ def chunk_precond_kda_bwd_kernel_intra(
     IS_VARLEN: tl.constexpr,
     SAFE_GATE: tl.constexpr = False,
     USE_GATHER: tl.constexpr = False,
-    DIAGONAL_DOT_PRECISION: tl.constexpr = DEFAULT_SOLVE_TRIL_PRECISION,
 ):
     """
     Asymmetric intra backward for preconditioned KDA.
@@ -768,19 +767,8 @@ def chunk_precond_kda_bwd_kernel_intra(
     b_k = tl.load(p_k, mask=m_ti[:, None] & m_k[None, :], other=0.0).to(tl.float32)
 
     if SAFE_GATE:
-        vector_diagonal = True
-    else:
-        # a value-centered tile bounds both factors without bounding the gate itself
-        b_gmax = tl.max(tl.where(m_ti[:, None], b_g, float('-inf')), 0)
-        b_gmin = tl.min(tl.where(m_ti[:, None], b_g, float('inf')), 0)
-        b_center = (b_gmax + b_gmin) * 0.5
-        vector_diagonal = tl.min(tl.where(m_k, (b_gmax - b_gmin <= 64).to(tl.int32), 1), 0) != 0
-
-    if vector_diagonal:
         # Vectorized upper diagonal (dq2/dk2): column side uses k_precond
-        if not SAFE_GATE:
-            b_gn = b_center[None, :]
-        elif USE_GATHER:
+        if USE_GATHER:
             b_gn = gather(b_g, tl.full([1, BK], min(BC//2, T - i_ti - 1), dtype=tl.int16), axis=0)
         else:
             p_gn = g + (i_ti + min(BC // 2, T - i_ti - 1)) * H*K + o_k
@@ -805,27 +793,23 @@ def chunk_precond_kda_bwd_kernel_intra(
 
         # Asymmetric: column side uses k_precond
         b_kp_exp_diag_qk = b_kp_diag * exp_neg_b_g_diag_qk
-        if SAFE_GATE:
-            b_dq2 += tl.dot(b_dAqk_diag_qk, b_kp_exp_diag_qk) * exp_b_g_diag_qk
-            b_dk2 += tl.dot(b_dAkk_diag_qk, b_kp_exp_diag_qk) * exp_b_g_diag_qk
-        else:
-            b_dq2 += tl.dot(b_dAqk_diag_qk, b_kp_exp_diag_qk, input_precision=DIAGONAL_DOT_PRECISION) * exp_b_g_diag_qk
-            b_dk2 += tl.dot(b_dAkk_diag_qk, b_kp_exp_diag_qk, input_precision=DIAGONAL_DOT_PRECISION) * exp_b_g_diag_qk
+        b_dq2 += tl.dot(b_dAqk_diag_qk, b_kp_exp_diag_qk) * exp_b_g_diag_qk
+        b_dk2 += tl.dot(b_dAkk_diag_qk, b_kp_exp_diag_qk) * exp_b_g_diag_qk
     else:
-        for j in range(0, min(BC, T - i_t * BT - i_i * BC)):
-            b_dAqk_val = tl.load(dAqk + o_dA + j, mask=m_dA, other=0).to(tl.float32)
-            b_dAkk_val = tl.load(dAkk + o_dA + j, mask=m_dA, other=0).to(tl.float32)
-
-            b_kpj = tl.load(p_kpj, mask=m_k, other=0).to(tl.float32)
-            b_gkj = tl.load(p_gkj, mask=m_k, other=0).to(tl.float32)
-
-            m_ij = o_i[:, None] >= j
-            b_kpgj = b_kpj[None, :] * exp2(b_g - b_gkj[None, :])
-            b_dq2 += tl.where(m_ij, b_dAqk_val[:, None] * b_kpgj, 0.)
-            b_dk2 += tl.where(m_ij, b_dAkk_val[:, None] * b_kpgj, 0.)
-
-            p_kpj += H*K
-            p_gkj += H*K
+        # process four direct gate differences together; no separated exponent can overflow
+        o_j = tl.arange(0, 4)
+        for j_start in range(0, min(BC, T - i_t * BT - i_i * BC), 4):
+            j = j_start + o_j
+            m_j = (j < BC) & (i_ti + j < T)
+            b_dAqk_val = tl.load(dAqk + o_dA[:, None] + j[None, :], mask=m_dA[:, None] & m_j[None, :], other=0).to(tl.float32)
+            b_dAkk_val = tl.load(dAkk + o_dA[:, None] + j[None, :], mask=m_dA[:, None] & m_j[None, :], other=0).to(tl.float32)
+            b_kpj = tl.load(p_kpj[None, :] + j[:, None] * H*K, mask=m_j[:, None] & m_k[None, :], other=0).to(tl.float32)
+            b_gkj = tl.load(p_gkj[None, :] + j[:, None] * H*K, mask=m_j[:, None] & m_k[None, :], other=0).to(tl.float32)
+            m_ij = (o_i[:, None] >= j[None, :]) & m_ti[:, None] & m_j[None, :]
+            b_delta = tl.where(m_ij[:, :, None], b_g[:, None, :] - b_gkj[None, :, :], 0.)
+            b_kpgj = tl.where(m_ij[:, :, None], b_kpj[None, :, :] * exp2(b_delta), 0.)
+            b_dq2 += tl.sum(b_dAqk_val[:, :, None] * b_kpgj, 1)
+            b_dk2 += tl.sum(b_dAkk_val[:, :, None] * b_kpgj, 1)
 
     b_db = tl.sum(b_dk2 * b_k, 1)
     p_db = db + o_ti*H
@@ -883,11 +867,9 @@ def chunk_precond_kda_bwd_kernel_intra(
 
         b_dkt *= exp2(b_gn_t[None, :] - b_g)
 
-    if vector_diagonal:
+    if SAFE_GATE:
         # Vectorized lower diagonal (dkt): row side uses q and k*beta
-        if not SAFE_GATE:
-            b_gn_t2 = b_center[None, :]
-        elif USE_GATHER:
+        if USE_GATHER:
             b_gn_t2 = gather(b_g, tl.full([1, BK], min(BC//2, T - i_ti - 1), dtype=tl.int16), axis=0)
         else:
             p_gn_t2 = g + (i_ti + min(BC // 2, T - i_ti - 1)) * H*K + o_k
@@ -916,12 +898,8 @@ def chunk_precond_kda_bwd_kernel_intra(
         b_q_exp = b_q_diag * exp_b_g_diag_kk
         b_kb_exp = b_k * b_b_diag[:, None] * exp_b_g_diag_kk
 
-        if SAFE_GATE:
-            b_dkt += tl.dot(b_dAqk_diag_kk, b_q_exp) * exp_neg_b_g_diag_kk
-            b_dkt += tl.dot(b_dAkk_diag_kk, b_kb_exp) * exp_neg_b_g_diag_kk
-        else:
-            b_dkt += tl.dot(b_dAqk_diag_kk, b_q_exp, input_precision=DIAGONAL_DOT_PRECISION) * exp_neg_b_g_diag_kk
-            b_dkt += tl.dot(b_dAkk_diag_kk, b_kb_exp, input_precision=DIAGONAL_DOT_PRECISION) * exp_neg_b_g_diag_kk
+        b_dkt += tl.dot(b_dAqk_diag_kk, b_q_exp) * exp_neg_b_g_diag_kk
+        b_dkt += tl.dot(b_dAkk_diag_kk, b_kb_exp) * exp_neg_b_g_diag_kk
     else:
         o_dA_t = i_ti * H*BT + i_i * BC + o_i
         p_qj = q + i_ti * H*K + o_k
@@ -929,26 +907,21 @@ def chunk_precond_kda_bwd_kernel_intra(
         p_gkj_t = g + i_ti * H*K + o_k
         p_bj = beta + i_ti * H
 
-        for j in range(0, min(BC, T - i_t * BT - i_i * BC)):
-            # [BC]
-            b_dAqk_t = tl.load(dAqk + o_dA_t + j * H*BT).to(tl.float32)
-            b_dAkk_t = tl.load(dAkk + o_dA_t + j * H*BT).to(tl.float32)
-            # [BK]
-            b_qj = tl.load(p_qj, mask=m_k, other=0).to(tl.float32)
-            b_kj = tl.load(p_kj, mask=m_k, other=0).to(tl.float32)
-            b_gkj_t = tl.load(p_gkj_t, mask=m_k, other=0).to(tl.float32)
-            b_bj = tl.load(p_bj).to(tl.float32)  # beta at row position j
-            # [BC, BK]
-            m_ij = o_i[:, None] <= j
-            b_gkq_t = exp2(b_gkj_t[None, :] - b_g)
-            # k with beta from ROW position, q without beta (Aqk has no beta)
-            b_dkt += tl.where(m_ij, (b_dAkk_t[:, None] * b_kj[None, :] * b_bj +
-                              b_dAqk_t[:, None] * b_qj[None, :]) * b_gkq_t, 0.)
-
-            p_qj += H*K
-            p_kj += H*K
-            p_gkj_t += H*K
-            p_bj += H
+        o_j = tl.arange(0, 4)
+        for j_start in range(0, min(BC, T - i_t * BT - i_i * BC), 4):
+            j = j_start + o_j
+            m_j = (j < BC) & (i_ti + j < T)
+            b_dAqk_t = tl.load(dAqk + o_dA_t[:, None] + j[None, :] * H*BT, mask=m_ti[:, None] & m_j[None, :], other=0).to(tl.float32)
+            b_dAkk_t = tl.load(dAkk + o_dA_t[:, None] + j[None, :] * H*BT, mask=m_ti[:, None] & m_j[None, :], other=0).to(tl.float32)
+            b_qj = tl.load(p_qj[None, :] + j[:, None] * H*K, mask=m_j[:, None] & m_k[None, :], other=0).to(tl.float32)
+            b_kj = tl.load(p_kj[None, :] + j[:, None] * H*K, mask=m_j[:, None] & m_k[None, :], other=0).to(tl.float32)
+            b_gkj_t = tl.load(p_gkj_t[None, :] + j[:, None] * H*K, mask=m_j[:, None] & m_k[None, :], other=0).to(tl.float32)
+            b_bj = tl.load(p_bj + j * H, mask=m_j, other=0).to(tl.float32)
+            m_ij = (o_i[:, None] <= j[None, :]) & m_ti[:, None] & m_j[None, :]
+            b_delta = tl.where(m_ij[:, :, None], b_gkj_t[None, :, :] - b_g[:, None, :], 0.)
+            b_value = (b_dAkk_t[:, :, None] * b_kj[None, :, :] * b_bj[None, :, None]
+                       + b_dAqk_t[:, :, None] * b_qj[None, :, :])
+            b_dkt += tl.sum(tl.where(m_ij[:, :, None], b_value * exp2(b_delta), 0.), 1)
 
     p_kp_local = k_precond + o_ti[:, None] * (H*K) + o_k[None, :]
     b_kp_local = tl.load(p_kp_local, mask=m_tik, other=0.0).to(tl.float32)
