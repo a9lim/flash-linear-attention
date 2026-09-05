@@ -797,15 +797,15 @@ def chunk_precond_kda_bwd_kernel_intra(
         b_dk2 += tl.dot(b_dAkk_diag_qk, b_kp_exp_diag_qk) * exp_b_g_diag_qk
     else:
         # process four direct gate differences together; no separated exponent can overflow
-        o_j = tl.arange(0, 4)
+        o_diag_j = tl.arange(0, 4)
         for j_start in range(0, min(BC, T - i_t * BT - i_i * BC), 4):
-            j = j_start + o_j
-            m_j = (j < BC) & (i_ti + j < T)
-            b_dAqk_val = tl.load(dAqk + o_dA[:, None] + j[None, :], mask=m_dA[:, None] & m_j[None, :], other=0).to(tl.float32)
-            b_dAkk_val = tl.load(dAkk + o_dA[:, None] + j[None, :], mask=m_dA[:, None] & m_j[None, :], other=0).to(tl.float32)
-            b_kpj = tl.load(p_kpj[None, :] + j[:, None] * H*K, mask=m_j[:, None] & m_k[None, :], other=0).to(tl.float32)
-            b_gkj = tl.load(p_gkj[None, :] + j[:, None] * H*K, mask=m_j[:, None] & m_k[None, :], other=0).to(tl.float32)
-            m_ij = (o_i[:, None] >= j[None, :]) & m_ti[:, None] & m_j[None, :]
+            j = j_start + o_diag_j
+            m_diag_j = (j < BC) & (i_ti + j < T)
+            b_dAqk_val = tl.load(dAqk + o_dA[:, None] + j[None, :], mask=m_dA[:, None] & m_diag_j[None, :], other=0).to(tl.float32)
+            b_dAkk_val = tl.load(dAkk + o_dA[:, None] + j[None, :], mask=m_dA[:, None] & m_diag_j[None, :], other=0).to(tl.float32)
+            b_kpj = tl.load(p_kpj[None, :] + j[:, None] * H*K, mask=m_diag_j[:, None] & m_k[None, :], other=0).to(tl.float32)
+            b_gkj = tl.load(p_gkj[None, :] + j[:, None] * H*K, mask=m_diag_j[:, None] & m_k[None, :], other=0).to(tl.float32)
+            m_ij = (o_i[:, None] >= j[None, :]) & m_ti[:, None] & m_diag_j[None, :]
             b_delta = tl.where(m_ij[:, :, None], b_g[:, None, :] - b_gkj[None, :, :], 0.)
             b_kpgj = tl.where(m_ij[:, :, None], b_kpj[None, :, :] * exp2(b_delta), 0.)
             b_dq2 += tl.sum(b_dAqk_val[:, :, None] * b_kpgj, 1)
@@ -907,17 +907,17 @@ def chunk_precond_kda_bwd_kernel_intra(
         p_gkj_t = g + i_ti * H*K + o_k
         p_bj = beta + i_ti * H
 
-        o_j = tl.arange(0, 4)
+        o_diag_j = tl.arange(0, 4)
         for j_start in range(0, min(BC, T - i_t * BT - i_i * BC), 4):
-            j = j_start + o_j
-            m_j = (j < BC) & (i_ti + j < T)
-            b_dAqk_t = tl.load(dAqk + o_dA_t[:, None] + j[None, :] * H*BT, mask=m_ti[:, None] & m_j[None, :], other=0).to(tl.float32)
-            b_dAkk_t = tl.load(dAkk + o_dA_t[:, None] + j[None, :] * H*BT, mask=m_ti[:, None] & m_j[None, :], other=0).to(tl.float32)
-            b_qj = tl.load(p_qj[None, :] + j[:, None] * H*K, mask=m_j[:, None] & m_k[None, :], other=0).to(tl.float32)
-            b_kj = tl.load(p_kj[None, :] + j[:, None] * H*K, mask=m_j[:, None] & m_k[None, :], other=0).to(tl.float32)
-            b_gkj_t = tl.load(p_gkj_t[None, :] + j[:, None] * H*K, mask=m_j[:, None] & m_k[None, :], other=0).to(tl.float32)
-            b_bj = tl.load(p_bj + j * H, mask=m_j, other=0).to(tl.float32)
-            m_ij = (o_i[:, None] <= j[None, :]) & m_ti[:, None] & m_j[None, :]
+            j = j_start + o_diag_j
+            m_diag_j = (j < BC) & (i_ti + j < T)
+            b_dAqk_t = tl.load(dAqk + o_dA_t[:, None] + j[None, :] * H*BT, mask=m_ti[:, None] & m_diag_j[None, :], other=0).to(tl.float32)
+            b_dAkk_t = tl.load(dAkk + o_dA_t[:, None] + j[None, :] * H*BT, mask=m_ti[:, None] & m_diag_j[None, :], other=0).to(tl.float32)
+            b_qj = tl.load(p_qj[None, :] + j[:, None] * H*K, mask=m_diag_j[:, None] & m_k[None, :], other=0).to(tl.float32)
+            b_kj = tl.load(p_kj[None, :] + j[:, None] * H*K, mask=m_diag_j[:, None] & m_k[None, :], other=0).to(tl.float32)
+            b_gkj_t = tl.load(p_gkj_t[None, :] + j[:, None] * H*K, mask=m_diag_j[:, None] & m_k[None, :], other=0).to(tl.float32)
+            b_bj = tl.load(p_bj + j * H, mask=m_diag_j, other=0).to(tl.float32)
+            m_ij = (o_i[:, None] <= j[None, :]) & m_ti[:, None] & m_diag_j[None, :]
             b_delta = tl.where(m_ij[:, :, None], b_gkj_t[None, :, :] - b_g[:, None, :], 0.)
             b_value = (b_dAkk_t[:, :, None] * b_kj[None, :, :] * b_bj[None, :, None]
                        + b_dAqk_t[:, :, None] * b_qj[None, :, :])
