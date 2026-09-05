@@ -767,8 +767,19 @@ def chunk_precond_kda_bwd_kernel_intra(
     b_k = tl.load(p_k, mask=m_ti[:, None] & m_k[None, :], other=0.0).to(tl.float32)
 
     if SAFE_GATE:
+        vector_diagonal = True
+    else:
+        # a value-centered tile bounds both factors without bounding the gate itself
+        b_gmax = tl.max(tl.where(m_ti[:, None], b_g, float('-inf')), 0)
+        b_gmin = tl.min(tl.where(m_ti[:, None], b_g, float('inf')), 0)
+        b_center = (b_gmax + b_gmin) * 0.5
+        vector_diagonal = tl.min(tl.where(m_k, (b_gmax - b_gmin <= 64).to(tl.int32), 1), 0) != 0
+
+    if vector_diagonal:
         # Vectorized upper diagonal (dq2/dk2): column side uses k_precond
-        if USE_GATHER:
+        if not SAFE_GATE:
+            b_gn = b_center[None, :]
+        elif USE_GATHER:
             b_gn = gather(b_g, tl.full([1, BK], min(BC//2, T - i_ti - 1), dtype=tl.int16), axis=0)
         else:
             p_gn = g + (i_ti + min(BC // 2, T - i_ti - 1)) * H*K + o_k
@@ -793,8 +804,12 @@ def chunk_precond_kda_bwd_kernel_intra(
 
         # Asymmetric: column side uses k_precond
         b_kp_exp_diag_qk = b_kp_diag * exp_neg_b_g_diag_qk
-        b_dq2 += tl.dot(b_dAqk_diag_qk, b_kp_exp_diag_qk) * exp_b_g_diag_qk
-        b_dk2 += tl.dot(b_dAkk_diag_qk, b_kp_exp_diag_qk) * exp_b_g_diag_qk
+        if SAFE_GATE:
+            b_dq2 += tl.dot(b_dAqk_diag_qk, b_kp_exp_diag_qk) * exp_b_g_diag_qk
+            b_dk2 += tl.dot(b_dAkk_diag_qk, b_kp_exp_diag_qk) * exp_b_g_diag_qk
+        else:
+            b_dq2 += tl.dot(b_dAqk_diag_qk, b_kp_exp_diag_qk, input_precision=DEFAULT_SOLVE_TRIL_PRECISION) * exp_b_g_diag_qk
+            b_dk2 += tl.dot(b_dAkk_diag_qk, b_kp_exp_diag_qk, input_precision=DEFAULT_SOLVE_TRIL_PRECISION) * exp_b_g_diag_qk
     else:
         for j in range(0, min(BC, T - i_t * BT - i_i * BC)):
             b_dAqk_val = tl.load(dAqk + o_dA + j, mask=m_dA, other=0).to(tl.float32)
@@ -867,9 +882,11 @@ def chunk_precond_kda_bwd_kernel_intra(
 
         b_dkt *= exp2(b_gn_t[None, :] - b_g)
 
-    if SAFE_GATE:
+    if vector_diagonal:
         # Vectorized lower diagonal (dkt): row side uses q and k*beta
-        if USE_GATHER:
+        if not SAFE_GATE:
+            b_gn_t2 = b_center[None, :]
+        elif USE_GATHER:
             b_gn_t2 = gather(b_g, tl.full([1, BK], min(BC//2, T - i_ti - 1), dtype=tl.int16), axis=0)
         else:
             p_gn_t2 = g + (i_ti + min(BC // 2, T - i_ti - 1)) * H*K + o_k
@@ -898,8 +915,12 @@ def chunk_precond_kda_bwd_kernel_intra(
         b_q_exp = b_q_diag * exp_b_g_diag_kk
         b_kb_exp = b_k * b_b_diag[:, None] * exp_b_g_diag_kk
 
-        b_dkt += tl.dot(b_dAqk_diag_kk, b_q_exp) * exp_neg_b_g_diag_kk
-        b_dkt += tl.dot(b_dAkk_diag_kk, b_kb_exp) * exp_neg_b_g_diag_kk
+        if SAFE_GATE:
+            b_dkt += tl.dot(b_dAqk_diag_kk, b_q_exp) * exp_neg_b_g_diag_kk
+            b_dkt += tl.dot(b_dAkk_diag_kk, b_kb_exp) * exp_neg_b_g_diag_kk
+        else:
+            b_dkt += tl.dot(b_dAqk_diag_kk, b_q_exp, input_precision=DEFAULT_SOLVE_TRIL_PRECISION) * exp_neg_b_g_diag_kk
+            b_dkt += tl.dot(b_dAkk_diag_kk, b_kb_exp, input_precision=DEFAULT_SOLVE_TRIL_PRECISION) * exp_neg_b_g_diag_kk
     else:
         o_dA_t = i_ti * H*BT + i_i * BC + o_i
         p_qj = q + i_ti * H*K + o_k
