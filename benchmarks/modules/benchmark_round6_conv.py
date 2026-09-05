@@ -49,6 +49,15 @@ def summarize(samples):
     }
 
 
+def difference(reference, actual):
+    ref, result = reference.float(), actual.float()
+    return {
+        'relative_l2': ((ref - result).norm() / ref.norm().clamp_min(1e-30)).item(),
+        'max_abs': (ref - result).abs().max().item(),
+        'norm_ratio': (result.norm() / ref.norm().clamp_min(1e-30)).item(),
+    }
+
+
 def capture(body):
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -115,13 +124,18 @@ def benchmark(args, baseline):
 
             reference = full_body(baseline, 'forward_backward')
             actual = full_body(candidate, 'forward_backward')
+            errors = {}
             for index, (ref, result) in enumerate(zip(reference[0][0], actual[0][0], strict=True)):
+                errors[f'output[{index}]'] = difference(ref, result)
                 assert_close(f'output[{index}]', ref, result, 1e-6)
             for name, ref, result in zip(('dx', 'dw', 'db', 'dr', 'dh0'), reference[1], actual[1], strict=True):
                 if ref is not None:
+                    errors[name] = difference(ref, result)
                     assert_close(name, ref, result, 1e-6)
                 else:
                     assert result is None
+                    errors[name] = None
+            print(json.dumps({'BT': BT, 'errors': errors}), flush=True)
             del reference, actual
 
             def kernel_body(kernel, buffers):
