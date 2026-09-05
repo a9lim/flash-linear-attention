@@ -568,7 +568,8 @@ def causal_conv1d_bwd_l2norm_kernel(
         HAS_BIAS=HAS_BIAS,
     )
     if W > 1:
-        BH: tl.constexpr = triton.next_power_of_2(W - 1)
+        # four rows also keep one- and two-row gathers out of Triton's unsupported layout conversion
+        BH: tl.constexpr = max(4, triton.next_power_of_2(W - 1))
         o_halo = i_t.to(tl.int64) * BT + BT + tl.arange(0, BH)
         b_halo = _causal_conv1d_l2norm_derivative(
             p_x=p_x,

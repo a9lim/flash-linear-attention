@@ -11,7 +11,7 @@ from einops import rearrange
 
 from fla.modules.backends import dispatch
 from fla.ops.utils import prepare_chunk_indices
-from fla.utils import input_guard
+from fla.utils import IS_NVIDIA, get_device_capability, input_guard
 
 from .kernels import (
     causal_conv1d_bwd_kernel,
@@ -254,6 +254,13 @@ def causal_conv1d_bwd(
         BD, NORM_D = _l2norm_geometry(D, l2norm_head_dim, l2norm_channels, initial_state, cu_seqlens)
         widths = _split_widths(split_outputs, D, BD, residual if split_outputs is not None else None)
         dys = list(dy) if split_outputs is not None else [dy]
+        # the smaller Ada tile keeps compact halo gathers spill-free on the dense Q/K/V workload
+        if (
+            BT == 64 and (B, T, D, W, BD, NORM_D) == (4, 1024, 3840, 4, 128, 2560)
+            and widths == (1280, 1280, 1280) and x.dtype == torch.bfloat16
+            and IS_NVIDIA and get_device_capability(x.device.index) == (8, 9)
+        ):
+            BT = 32
         NT = triton.cdiv(T, BT)
         dx = torch.empty_like(x)
         dw = weight.new_empty(B*NT, *weight.shape, dtype=torch.float)

@@ -14,6 +14,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import types
 from pathlib import Path
 
 import torch
@@ -24,16 +25,20 @@ from fla.utils import assert_close
 
 
 def load_baseline(base, directory):
-    path = Path(directory) / 'round6_conv_baseline.py'
-    source = subprocess.check_output(
-        ['git', 'show', f'{base}:fla/modules/conv/triton/kernels.py'], text=True,
-    )
-    path.write_text(source)
-    spec = importlib.util.spec_from_file_location('round6_conv_baseline', path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module.causal_conv1d_bwd_l2norm_kernel
+    package = types.ModuleType('round6_conv_baseline')
+    package.__path__ = [directory]
+    sys.modules[package.__name__] = package
+    for name in ('kernels', 'ops'):
+        path = Path(directory) / f'{name}.py'
+        source = subprocess.check_output(
+            ['git', 'show', f'{base}:fla/modules/conv/triton/{name}.py'], text=True,
+        )
+        path.write_text(source)
+        spec = importlib.util.spec_from_file_location(f'round6_conv_baseline.{name}', path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+    return module
 
 
 def summarize(samples):
@@ -88,7 +93,7 @@ def paired(graphs, rounds, replays):
     return samples
 
 
-def benchmark(args, baseline):
+def benchmark(args, baseline_ops):
     torch.manual_seed(42)
     torch.set_float32_matmul_precision('high')
     B, T, HD, H, W = args.batch, args.length, args.head_dim, args.heads, args.width
@@ -104,6 +109,7 @@ def benchmark(args, baseline):
         l2norm_head_dim=HD, l2norm_channels=2 * D // 3, split_outputs=widths,
     )
     candidate = ops.causal_conv1d_bwd_l2norm_kernel
+    baseline = baseline_ops.causal_conv1d_bwd_l2norm_kernel
     print(json.dumps({
         'base': args.base,
         'candidate': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
@@ -117,9 +123,9 @@ def benchmark(args, baseline):
             baseline_tile = args.baseline_tile or BT
 
             def full_body(kernel, mode, backward_tile):
-                ops.causal_conv1d_bwd_l2norm_kernel = kernel
-                forward = ops.causal_conv1d_fwd(**common, BT=args.forward_tile) if mode != 'backward' else None
-                backward = ops.causal_conv1d_bwd(**common, dy=dys, dht=None, BT=backward_tile) if mode != 'forward' else None
+                wrapper = baseline_ops if kernel is baseline else ops
+                forward = wrapper.causal_conv1d_fwd(**common, BT=args.forward_tile) if mode != 'backward' else None
+                backward = wrapper.causal_conv1d_bwd(**common, dy=dys, dht=None, BT=backward_tile) if mode != 'forward' else None
                 return forward, backward
 
             reference = full_body(baseline, 'forward_backward', baseline_tile)
@@ -184,6 +190,7 @@ def benchmark(args, baseline):
                 base_stats, candidate_stats = map(summarize, samples)
                 print(json.dumps({
                     'BT': BT, 'baseline_BT': baseline_tile, 'forward_BT': args.forward_tile,
+                    'wrapper_tiles': 'requested tiles; each revision applies its own production dispatch',
                     'mode': mode, 'baseline': base_stats, 'candidate': candidate_stats,
                     'speedup': base_stats['median_ms'] / candidate_stats['median_ms'],
                     'resources': resources,
