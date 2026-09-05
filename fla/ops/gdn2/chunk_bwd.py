@@ -66,7 +66,9 @@ NUM_WARPS_WY = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
         for num_stages in [2, 3, 4]
         if not (IS_NVIDIA_HOPPER and BK == 32 and num_warps == 4)
     ],
-    key=['BT', 'STATE_V_FIRST'],
+    # NOTE: H is excluded on purpose -- it only scales the grid (NT, B * H) and
+    # strides addressing, so it does not shape the work the BK/BV sweep tunes.
+    key=['BT', 'K', 'V', 'STATE_V_FIRST'],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
