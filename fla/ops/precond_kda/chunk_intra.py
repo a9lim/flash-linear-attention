@@ -668,6 +668,7 @@ def chunk_precond_kda_bwd_kernel_intra(
     IS_VARLEN: tl.constexpr,
     SAFE_GATE: tl.constexpr = False,
     USE_GATHER: tl.constexpr = False,
+    DIAGONAL_DOT_PRECISION: tl.constexpr = DEFAULT_SOLVE_TRIL_PRECISION,
 ):
     """
     Asymmetric intra backward for preconditioned KDA.
@@ -808,8 +809,8 @@ def chunk_precond_kda_bwd_kernel_intra(
             b_dq2 += tl.dot(b_dAqk_diag_qk, b_kp_exp_diag_qk) * exp_b_g_diag_qk
             b_dk2 += tl.dot(b_dAkk_diag_qk, b_kp_exp_diag_qk) * exp_b_g_diag_qk
         else:
-            b_dq2 += tl.dot(b_dAqk_diag_qk, b_kp_exp_diag_qk, input_precision=DEFAULT_SOLVE_TRIL_PRECISION) * exp_b_g_diag_qk
-            b_dk2 += tl.dot(b_dAkk_diag_qk, b_kp_exp_diag_qk, input_precision=DEFAULT_SOLVE_TRIL_PRECISION) * exp_b_g_diag_qk
+            b_dq2 += tl.dot(b_dAqk_diag_qk, b_kp_exp_diag_qk, input_precision=DIAGONAL_DOT_PRECISION) * exp_b_g_diag_qk
+            b_dk2 += tl.dot(b_dAkk_diag_qk, b_kp_exp_diag_qk, input_precision=DIAGONAL_DOT_PRECISION) * exp_b_g_diag_qk
     else:
         for j in range(0, min(BC, T - i_t * BT - i_i * BC)):
             b_dAqk_val = tl.load(dAqk + o_dA + j, mask=m_dA, other=0).to(tl.float32)
@@ -919,8 +920,8 @@ def chunk_precond_kda_bwd_kernel_intra(
             b_dkt += tl.dot(b_dAqk_diag_kk, b_q_exp) * exp_neg_b_g_diag_kk
             b_dkt += tl.dot(b_dAkk_diag_kk, b_kb_exp) * exp_neg_b_g_diag_kk
         else:
-            b_dkt += tl.dot(b_dAqk_diag_kk, b_q_exp, input_precision=DEFAULT_SOLVE_TRIL_PRECISION) * exp_neg_b_g_diag_kk
-            b_dkt += tl.dot(b_dAkk_diag_kk, b_kb_exp, input_precision=DEFAULT_SOLVE_TRIL_PRECISION) * exp_neg_b_g_diag_kk
+            b_dkt += tl.dot(b_dAqk_diag_kk, b_q_exp, input_precision=DIAGONAL_DOT_PRECISION) * exp_neg_b_g_diag_kk
+            b_dkt += tl.dot(b_dAkk_diag_kk, b_kb_exp, input_precision=DIAGONAL_DOT_PRECISION) * exp_neg_b_g_diag_kk
     else:
         o_dA_t = i_ti * H*BT + i_i * BC + o_i
         p_qj = q + i_ti * H*K + o_k
