@@ -114,16 +114,16 @@ def benchmark(args, baseline):
     }), flush=True)
     try:
         for BT in args.tiles:
-            NT = triton.cdiv(T, BT)
+            baseline_tile = args.baseline_tile or BT
 
-            def full_body(kernel, mode):
+            def full_body(kernel, mode, backward_tile):
                 ops.causal_conv1d_bwd_l2norm_kernel = kernel
-                forward = ops.causal_conv1d_fwd(**common, BT=BT) if mode != 'backward' else None
-                backward = ops.causal_conv1d_bwd(**common, dy=dys, dht=None, BT=BT) if mode != 'forward' else None
+                forward = ops.causal_conv1d_fwd(**common, BT=args.forward_tile) if mode != 'backward' else None
+                backward = ops.causal_conv1d_bwd(**common, dy=dys, dht=None, BT=backward_tile) if mode != 'forward' else None
                 return forward, backward
 
-            reference = full_body(baseline, 'forward_backward')
-            actual = full_body(candidate, 'forward_backward')
+            reference = full_body(baseline, 'forward_backward', baseline_tile)
+            actual = full_body(candidate, 'forward_backward', BT)
             errors = {}
             for index, (ref, result) in enumerate(zip(reference[0][0], actual[0][0], strict=True)):
                 errors[f'output[{index}]'] = difference(ref, result)
@@ -135,20 +135,20 @@ def benchmark(args, baseline):
                 else:
                     assert result is None
                     errors[name] = None
-            print(json.dumps({'BT': BT, 'errors': errors}), flush=True)
+            print(json.dumps({'BT': BT, 'baseline_BT': baseline_tile, 'errors': errors}), flush=True)
             del reference, actual
 
-            def kernel_body(kernel, buffers):
+            def kernel_body(kernel, buffers, tile):
                 dx, dw, db = buffers
                 offset = 0
                 compiled = []
                 for dy, width in zip(dys, widths, strict=True):
-                    result = kernel[(width // HD, NT, B)](
+                    result = kernel[(width // HD, triton.cdiv(T, tile), B)](
                         x=x, weight=weight, bias=bias, dy=dy, dx=dx, dw=dw, db=db, T=T,
                         stride_x_n=x.stride(0), stride_x_t=x.stride(1), stride_x_d=x.stride(2),
                         stride_dx_n=dx.stride(0), stride_dx_t=dx.stride(1), stride_dx_d=dx.stride(2),
                         stride_dy_n=dy.stride(0), stride_dy_t=dy.stride(1), stride_dy_d=dy.stride(2),
-                        Y_OFF=offset, D=D, W=W, BT=BT, BW=triton.next_power_of_2(W), BD=HD,
+                        Y_OFF=offset, D=D, W=W, BT=tile, BW=triton.next_power_of_2(W), BD=HD,
                         NORM_D=2 * D // 3, EPS=1e-6, ACTIVATION='silu',
                     )
                     compiled.append(result)
@@ -157,15 +157,15 @@ def benchmark(args, baseline):
 
             for mode in ('kernel_backward', 'forward', 'backward', 'forward_backward'):
                 graph_outputs, buffers, resources = [], [], []
-                for kernel in (baseline, candidate):
+                for kernel, tile in ((baseline, baseline_tile), (candidate, BT)):
                     if mode == 'kernel_backward':
                         storage = (
                             torch.empty_like(x),
-                            torch.empty(B * NT, D, W, device='cuda'),
-                            torch.empty(B * NT, D, device='cuda'),
+                            torch.empty(B * triton.cdiv(T, tile), D, W, device='cuda'),
+                            torch.empty(B * triton.cdiv(T, tile), D, device='cuda'),
                         )
                         buffers.append(storage)
-                        compiled = kernel_body(kernel, storage)
+                        compiled = kernel_body(kernel, storage, tile)
                         resources.append([
                             {
                                 'registers': getattr(item, 'n_regs', None),
@@ -174,16 +174,17 @@ def benchmark(args, baseline):
                             }
                             for item in compiled
                         ])
-                        def body(kernel=kernel, storage=storage):
-                            return kernel_body(kernel, storage)
+                        def body(kernel=kernel, storage=storage, tile=tile):
+                            return kernel_body(kernel, storage, tile)
                     else:
-                        def body(kernel=kernel, mode=mode):
-                            return full_body(kernel, mode)
+                        def body(kernel=kernel, mode=mode, tile=tile):
+                            return full_body(kernel, mode, tile)
                     graph_outputs.append(capture(body))
                 samples = paired([item[0] for item in graph_outputs], args.rounds, args.replays)
                 base_stats, candidate_stats = map(summarize, samples)
                 print(json.dumps({
-                    'BT': BT, 'mode': mode, 'baseline': base_stats, 'candidate': candidate_stats,
+                    'BT': BT, 'baseline_BT': baseline_tile, 'forward_BT': args.forward_tile,
+                    'mode': mode, 'baseline': base_stats, 'candidate': candidate_stats,
                     'speedup': base_stats['median_ms'] / candidate_stats['median_ms'],
                     'resources': resources,
                     'allocated_mib': torch.cuda.memory_allocated() / 2**20,
@@ -203,6 +204,8 @@ def main():
     parser.add_argument('--head-dim', type=int, default=128)
     parser.add_argument('--width', type=int, default=4)
     parser.add_argument('--tiles', type=int, nargs='+', default=[64, 32])
+    parser.add_argument('--baseline-tile', type=int, default=None)
+    parser.add_argument('--forward-tile', type=int, default=64)
     parser.add_argument('--rounds', type=int, default=12)
     parser.add_argument('--replays', type=int, default=30)
     args = parser.parse_args()

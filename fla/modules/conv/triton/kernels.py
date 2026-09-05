@@ -419,12 +419,67 @@ def causal_conv1d_fwd_l2norm_kernel(
     tl.store(p_y, tl.cast(b_y, dtype=p_y.dtype.element_ty, fp_downcast_rounding='rtne'), mask=m_y)
 
 
+@triton.jit
+def _causal_conv1d_l2norm_derivative(
+    p_x,
+    p_dy,
+    b_w,
+    b_bias,
+    o_w,
+    o_d,
+    o_dl,
+    o_dy,
+    normalize,
+    T,
+    stride_x_t,
+    stride_x_d,
+    stride_dy_t,
+    stride_dy_d,
+    D: tl.constexpr,
+    W: tl.constexpr,
+    BD: tl.constexpr,
+    EPS: tl.constexpr,
+    ACTIVATION: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+):
+    m_d = o_d < D
+    m_dy = (o_dy < T)[:, None] & m_d[None, :]
+    b_dz = tl.load(p_dy + o_dy[:, None] * stride_dy_t + o_dl[None, :] * stride_dy_d, mask=m_dy, other=0.0).to(tl.float32)
+    b_y = tl.full((o_dy.shape[0], BD), 0, dtype=tl.float32)
+    for j_w in tl.static_range(-W + 1, 1):
+        o_x = o_dy + j_w
+        b_xi = tl.load(
+            p_x + o_x[:, None] * stride_x_t + o_d[None, :] * stride_x_d,
+            mask=((o_x >= 0) & (o_x < T))[:, None] & m_d[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        b_xi *= tl.sum(b_w * (o_w == (j_w + W - 1)), 1)
+        b_y += b_xi
+    if HAS_BIAS:
+        b_y += b_bias[None, :]
+
+    if ACTIVATION == 'swish' or ACTIVATION == 'silu':
+        b_ys = tl.sigmoid(b_y)
+        b_s = b_y * b_ys
+    else:
+        b_s = b_y
+
+    if normalize:
+        b_rstd = 1 / tl.sqrt(tl.sum(b_s * b_s, 1) + EPS)
+        b_z = b_s * b_rstd[:, None]
+        b_dz = (b_dz - b_z * tl.sum(b_dz * b_z, 1)[:, None]) * b_rstd[:, None]
+
+    if ACTIVATION == 'swish' or ACTIVATION == 'silu':
+        return b_dz * b_ys * (1 + b_y * (1 - b_ys))
+    return b_dz
+
+
 @triton.heuristics({
     'HAS_BIAS': lambda args: args['db'] is not None,
 })
 @fla_cache_autotune(
     configs=[triton.Config({}, num_warps=num_warps) for num_warps in [2, 4, 8]],
-    key=['D', 'W', 'BD', 'NORM_D'],
+    key=['D', 'W', 'BT', 'BD', 'NORM_D'],
     **autotune_cache_kwargs,
 )
 @triton.jit
@@ -487,44 +542,65 @@ def causal_conv1d_bwd_l2norm_kernel(
         b_bias = tl.load(bias + o_d, mask=m_d, other=0.0).to(tl.float32)
         b_db = tl.zeros((BD,), dtype=tl.float32)
 
-    BTH: tl.constexpr = triton.next_power_of_2(BT + W - 1)
-    o_dy = i_t.to(tl.int64) * BT + tl.arange(0, BTH)
-    m_dy = (o_dy < T)[:, None] & m_d[None, :]
-    b_dz = tl.load(p_dy + o_dy[:, None] * stride_dy_t + o_dl[None, :] * stride_dy_d, mask=m_dy, other=0.0).to(tl.float32)
-
-    b_y = tl.zeros((BTH, BD), dtype=tl.float32)
-    for j_w in tl.static_range(-W + 1, 1):
-        o_x = o_dy + j_w
-        b_xi = tl.load(
-            p_x + o_x[:, None] * stride_x_t + o_d[None, :] * stride_x_d,
-            mask=((o_x >= 0) & (o_x < T))[:, None] & m_d[None, :],
-            other=0.0,
-        ).to(tl.float32)
-        b_xi *= tl.sum(b_w * (o_w == (j_w + W - 1)), 1)
-        b_y += b_xi
-    if HAS_BIAS:
-        b_y += b_bias[None, :]
-
-    if ACTIVATION == 'swish' or ACTIVATION == 'silu':
-        b_ys = tl.sigmoid(b_y)
-        b_s = b_y * b_ys
-    else:
-        b_s = b_y
-
-    if Y_OFF + i_d * BD < NORM_D:
-        b_rstd = 1 / tl.sqrt(tl.sum(b_s * b_s, 1) + EPS)
-        b_z = b_s * b_rstd[:, None]
-        b_dz = (b_dz - b_z * tl.sum(b_dz * b_z, 1)[:, None]) * b_rstd[:, None]
-
-    if ACTIVATION == 'swish' or ACTIVATION == 'silu':
-        b_derivative = b_dz * b_ys * (1 + b_y * (1 - b_ys))
-    else:
-        b_derivative = b_dz
+    if not HAS_BIAS:
+        b_bias = tl.full((BD,), 0, dtype=tl.float32)
+    normalize = Y_OFF + i_d * BD < NORM_D
+    b_derivative = _causal_conv1d_l2norm_derivative(
+        p_x=p_x,
+        p_dy=p_dy,
+        b_w=b_w,
+        b_bias=b_bias,
+        o_w=o_w,
+        o_d=o_d,
+        o_dl=o_dl,
+        o_dy=o_t,
+        normalize=normalize,
+        T=T,
+        stride_x_t=stride_x_t,
+        stride_x_d=stride_x_d,
+        stride_dy_t=stride_dy_t,
+        stride_dy_d=stride_dy_d,
+        D=D,
+        W=W,
+        BD=BD,
+        EPS=EPS,
+        ACTIVATION=ACTIVATION,
+        HAS_BIAS=HAS_BIAS,
+    )
+    if W > 1:
+        BH: tl.constexpr = triton.next_power_of_2(W - 1)
+        o_halo = i_t.to(tl.int64) * BT + BT + tl.arange(0, BH)
+        b_halo = _causal_conv1d_l2norm_derivative(
+            p_x=p_x,
+            p_dy=p_dy,
+            b_w=b_w,
+            b_bias=b_bias,
+            o_w=o_w,
+            o_d=o_d,
+            o_dl=o_dl,
+            o_dy=o_halo,
+            normalize=normalize,
+            T=T,
+            stride_x_t=stride_x_t,
+            stride_x_d=stride_x_d,
+            stride_dy_t=stride_dy_t,
+            stride_dy_d=stride_dy_d,
+            D=D,
+            W=W,
+            BD=BD,
+            EPS=EPS,
+            ACTIVATION=ACTIVATION,
+            HAS_BIAS=HAS_BIAS,
+        )
 
     b_dx = tl.zeros((BT, BD), dtype=tl.float32)
     for i_w in tl.static_range(0, W):
-        o_shift = tl.broadcast_to((tl.arange(0, BT) + i_w)[:, None], (BT, BD))
-        b_dy = tl.gather(b_derivative, o_shift, axis=0)
+        o_shift = tl.arange(0, BT) + i_w
+        b_dy = tl.gather(b_derivative, tl.broadcast_to((o_shift % BT)[:, None], (BT, BD)), axis=0)
+        if i_w > 0:
+            o_tail = tl.maximum(o_shift - BT, 0)
+            b_tail = tl.gather(b_halo, tl.broadcast_to(o_tail[:, None], (BT, BD)), axis=0)
+            b_dy = tl.where((o_shift < BT)[:, None], b_dy, b_tail)
 
         b_dw = tl.sum(b_dy * b_x, 0)
         tl.store(dw + i_tg * D*W + o_d * W + W - i_w - 1, b_dw.to(dw.dtype.element_ty), mask=m_d)
