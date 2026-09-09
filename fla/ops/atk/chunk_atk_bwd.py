@@ -179,7 +179,7 @@ def _atk_backward_chunk_out(
         else:
             gk_ptr = gk_out + b * gk_stride_b + T_range[:, None] * \
                 gk_stride_t + h * gk_stride_h + D_range[None, :] * gk_stride_d
-        tl.store(gk_ptr, gk_val, mask=mask_T[:, None] * mask_D[None, :])
+        tl.store(gk_ptr, gk_val.to(gk_out.dtype.element_ty), mask=mask_T[:, None] * mask_D[None, :])
 
     if IS_VARLEN:
         gg_ptr = gg_out + (bos + T_range) * gg_stride_t + h * gg_stride_h
@@ -488,8 +488,11 @@ def chunk_atk_bwd(
     logx = math.log(x) if x > 0 else 0.0
 
     # Scratch for the local backward; every in-range element is written there.
-    gk = torch.empty_like(k, dtype=torch.float32)
+    # With FUSE_DK it is a pure single-writer hand-off between the two kernels,
+    # so it carries the activation dtype; without it the same buffer is also
+    # the returned dk and stays fp32.
     fuse_dk = dk_intra is not None
+    gk = torch.empty_like(k, dtype=k.dtype if fuse_dk else torch.float32)
     dk_out = dk_intra if fuse_dk else gk
     g_log_atk_scale = torch.zeros(H, device=k.device, dtype=torch.float32)
     gg = torch.zeros_like(g_raw, dtype=torch.float32)
