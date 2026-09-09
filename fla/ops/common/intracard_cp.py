@@ -126,6 +126,7 @@ def _raw_chunk_gated_delta_rule_fwd_h(
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
         T=T,
+        N=N,
         HV=HV,
         H=H,
         K=K,

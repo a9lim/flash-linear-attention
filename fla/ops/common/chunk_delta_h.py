@@ -16,6 +16,7 @@ from fla.ops.utils.graph import get_static_buffer
 from fla.ops.utils.op import exp2
 from fla.utils import (
     IS_INTEL,
+    IS_NVIDIA,
     IS_NVIDIA_BLACKWELL,
     IS_NVIDIA_HOPPER,
     autotune_cache_kwargs,
@@ -36,6 +37,11 @@ elif IS_INTEL:
 else:
     GATED_DELTA_RULE_FWD_H_NUM_WARPS = [2, 4]
 
+GATED_DELTA_RULE_STATE_BV = (
+    [16, 32, 64] if IS_NVIDIA and torch.cuda.get_device_capability() == (8, 9)
+    else [32, 64] if check_shared_mem('ada') else [32]
+)
+
 
 @triton.heuristics({
     'USE_G': lambda args: args['g'] is not None,
@@ -50,9 +56,9 @@ else:
         triton.Config({'BV': BV}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in GATED_DELTA_RULE_FWD_H_NUM_WARPS
         for num_stages in ([2, 3, 4] if check_shared_mem('ampere') else [1, 2, 3] if check_shared_mem('ada') else [2, 1])
-        for BV in ([32, 64] if check_shared_mem('ada') else [32])
+        for BV in GATED_DELTA_RULE_STATE_BV
     ],
-    key=['H', 'HV', 'K', 'V', 'BT', 'STATE_V_FIRST'],
+    key=['N', 'T', 'H', 'HV', 'K', 'V', 'BT', 'STATE_V_FIRST'],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -69,6 +75,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     cu_seqlens,
     chunk_offsets,
     T,
+    N: tl.constexpr,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -361,9 +368,9 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         triton.Config({'BV': BV}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [2, 4]
         for num_stages in ([2, 3, 4] if check_shared_mem('ampere') else [1, 2, 3] if check_shared_mem('ada') else [1])
-        for BV in ([32, 64] if check_shared_mem('ada') else [32])
+        for BV in GATED_DELTA_RULE_STATE_BV
     ],
-    key=['H', 'HV', 'K', 'V', 'BT', 'BV', 'USE_G', 'STATE_V_FIRST'],
+    key=['N', 'T', 'H', 'HV', 'K', 'V', 'BT', 'BV', 'USE_G', 'STATE_V_FIRST'],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -383,6 +390,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
     chunk_offsets,
     scale,
     T,
+    N: tl.constexpr,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -737,6 +745,7 @@ def chunk_gated_delta_rule_fwd_h(
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
         T=T,
+        N=N,
         H=H,
         HV=HV,
         K=K,
@@ -812,6 +821,7 @@ def chunk_gated_delta_rule_bwd_dhu(
         chunk_offsets=chunk_offsets,
         scale=scale,
         T=T,
+        N=N,
         H=H,
         HV=HV,
         K=K,
