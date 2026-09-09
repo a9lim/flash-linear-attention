@@ -164,7 +164,6 @@ def chunk_precond_kda_bwd(
     disable_recompute: bool = False,
     defer_dg_cumsum: bool = False,
     w: torch.Tensor | None = None,
-    u: torch.Tensor | None = None,
     kg: torch.Tensor | None = None,
     v_new: torch.Tensor | None = None,
     h: torch.Tensor | None = None,
@@ -232,8 +231,6 @@ def chunk_precond_kda_bwd(
 
     # Step 3: dAqk and local dv (matching KDA's chunk_kda_bwd_dAv)
     dAqk, dv = chunk_precond_kda_bwd_dAv(
-        q=q,
-        k=k,
         v=v_new,
         do=do,
         A=Aqk,
@@ -436,6 +433,10 @@ class ChunkPrecondKDAFunction(torch.autograd.Function):
         if not disable_recompute:
             w, u, kg, v_new, h = None, None, None, None, None
 
+        # u is only ever read by the branch that recomputes it, so keeping it
+        # would be 10.5 MB of dead activation per layer instance.
+        u = None
+
         ctx.save_for_backward(
             q, q_rstd, k, k_rstd, v, g, g_org, g_atk, beta_atk, beta,
             Aqk, Akk, initial_state,
@@ -513,7 +514,6 @@ class ChunkPrecondKDAFunction(torch.autograd.Function):
             disable_recompute=ctx.disable_recompute,
             defer_dg_cumsum=defer_dg_cumsum,
             w=w,
-            u=u,
             kg=kg,
             v_new=v_new,
             h=h,

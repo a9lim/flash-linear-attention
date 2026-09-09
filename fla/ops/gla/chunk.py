@@ -1004,8 +1004,10 @@ def chunk_gla_fwd_o_gk(
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
-    # Please ensure zeros, since vllm will use padding v
-    o = torch.zeros_like(v)
+    # Dense input has every row of o written by exactly one program, so the
+    # memset is pure overhead there; varlen keeps it, since vLLM pads v and a
+    # graph launch skips the padded chunks outright.
+    o = torch.empty_like(v) if cu_seqlens is None else torch.zeros_like(v)
     def grid(meta): return (triton.cdiv(V, meta['BV']), NT, B * HV)
     chunk_gla_fwd_kernel_o[grid](
         q=q,

@@ -199,7 +199,7 @@ def _atk_backward_chunk_out(
 })
 @triton.jit(do_not_specialize=['T'])
 def _atk_backward_pass_chunks(
-    a, sa, ac,            # forward buffers
+    sa, ac,               # forward buffers
     h0,                   # *f32 [N, H, D] or None - initial ATK state
     gac_from_out,         # grad entering each ac[i] from later usage
     ga, gsa,              # outputs (+=)
@@ -207,7 +207,6 @@ def _atk_backward_pass_chunks(
     cu_seqlens,           # *i32 [N+1] - cumulative sequence lengths
     B: tl.constexpr, T, H: tl.constexpr, D: tl.constexpr,
     CHUNK_LEN: tl.constexpr,
-    a_stride_b, a_stride_c, a_stride_h, a_stride_d,
     sa_stride_b, sa_stride_c, sa_stride_h,
     ac_stride_b, ac_stride_c, ac_stride_h, ac_stride_d,
     gac_stride_b, gac_stride_c, gac_stride_h, gac_stride_d,
@@ -245,7 +244,6 @@ def _atk_backward_pass_chunks(
     D_mask = D_range < D
 
     sa_ptr = sa + b * sa_stride_b + h * sa_stride_h + (N_chunks - 1) * sa_stride_c
-    a_ptr = a + b * a_stride_b + h * a_stride_h + D_range * a_stride_d + (N_chunks - 1) * a_stride_c
     ac_ptr = ac + b * ac_stride_b + h * ac_stride_h + D_range * ac_stride_d + (N_chunks - 1) * ac_stride_c
     gac_ptr = gac_from_out + b * gac_stride_b + h * gac_stride_h + D_range * gac_stride_d + (N_chunks - 1) * gac_stride_c
     gsa_ptr = gsa + b * gsa_stride_b + h * gsa_stride_h + (N_chunks - 1) * gsa_stride_c
@@ -276,7 +274,6 @@ def _atk_backward_pass_chunks(
         tl.store(gsa_ptr, gsa_val)
 
         sa_ptr -= sa_stride_c
-        a_ptr -= a_stride_c
         ac_ptr -= ac_stride_c
         gac_ptr -= gac_stride_c
         ga_ptr -= ga_stride_c
@@ -541,14 +538,13 @@ def chunk_atk_bwd(
     )
 
     _atk_backward_pass_chunks[grid2](
-        a, sa, ac,
+        sa, ac,
         initial_A_state,
         gac_prev,
         ga, gsa,
         dh0,
         cu_seqlens,
         B, T, H, K, CHUNK_LEN,
-        a.stride(0), a.stride(1), a.stride(2), a.stride(3),
         sa.stride(0), sa.stride(1), sa.stride(2),
         ac.stride(0), ac.stride(1), ac.stride(2), ac.stride(3),
         gac_prev.stride(0), gac_prev.stride(1), gac_prev.stride(2), gac_prev.stride(3),
