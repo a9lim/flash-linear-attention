@@ -27,6 +27,7 @@ from triton.compiler.errors import CompilationError
 from triton.runtime.errors import OutOfResources
 
 import fla.ops.common.chunk_delta_h as state_ops
+import fla.ops.utils.cache as cache_ops
 from fla.ops.precond_kda import chunk_precond_kda
 from fla.utils import assert_close
 
@@ -55,15 +56,42 @@ def autotuner(kernel):
 def force_config(kernel, config):
     tuner = autotuner(kernel)
     configs, cache = tuner.configs, tuner.cache
+    old_best = getattr(tuner, 'best_config', None)
+    cache_mode = cache_ops.FLA_CACHE_MODE
     tuner.configs, tuner.cache = [config], {}
+    cache_ops.FLA_CACHE_MODE = cache_ops.FlaCacheMode.DISABLED
     try:
         yield
+        actual = getattr(tuner, 'best_config', None)
+        if actual is None or config_dict(actual) != config_dict(config):
+            raise RuntimeError(f'Forced configuration was not selected: {config_dict(config)}')
     finally:
         tuner.configs, tuner.cache = configs, cache
+        cache_ops.FLA_CACHE_MODE = cache_mode
+        if old_best is not None:
+            tuner.best_config = old_best
+        elif hasattr(tuner, 'best_config'):
+            del tuner.best_config
 
 
 def config_dict(config):
     return dict(BV=config.kwargs['BV'], num_warps=config.num_warps, num_stages=config.num_stages)
+
+
+def state_kernel(module, direction):
+    name = ('chunk_gated_delta_rule_fwd_kernel_h_blockdim64' if direction == 'forward'
+            else 'chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64')
+    return getattr(module, name)
+
+
+def tuning_result(kernel):
+    tuner = autotuner(kernel)
+    selected = getattr(tuner, 'best_config', None)
+    return dict(
+        selected=config_dict(selected) if selected is not None else None,
+        key_fields=list(tuner.keys),
+        cached_keys=[list(key) for key in tuner.cache],
+    )
 
 
 def parse_config(value):
@@ -160,7 +188,16 @@ def sweep(baseline, args):
         candidate_call = partial(state_call, state_ops, direction, values)
         expected = tuple(t.clone() if t is not None else None for t in baseline_call())
         baseline_time = graph_time(baseline_call, args.replays, args.samples)
-        print(json.dumps(dict(direction=direction, variant='baseline', **baseline_time)), flush=True)
+        print(json.dumps(dict(
+            direction=direction, variant='baseline', **baseline_time,
+            tuning=tuning_result(state_kernel(baseline, direction)),
+        )), flush=True)
+        default_differences = errors(expected, candidate_call(), names)
+        default_time = graph_time(candidate_call, args.replays, args.samples)
+        print(json.dumps(dict(
+            direction=direction, variant='candidate_default', **default_time,
+            tuning=tuning_result(kernel), differences=default_differences,
+        )), flush=True)
         configs = list(autotuner(kernel).configs)
         results[direction] = []
         for config in configs:
@@ -217,8 +254,8 @@ def pkda_state_operators(module):
             setattr(chunk, name, function)
 
 
-def pkda_call(module, values, do):
-    inputs = {name: value.detach().clone().requires_grad_() for name, value in values.items()}
+def pkda_call(module, values, do, *, prepared=False):
+    inputs = values if prepared else {name: value.detach().clone().requires_grad_() for name, value in values.items()}
     with pkda_state_operators(module), torch.enable_grad(), torch.autocast('cuda', dtype=torch.bfloat16):
         output, _, _ = chunk_precond_kda(
             **inputs, scale=128**-.5, output_final_state=False,
@@ -232,14 +269,32 @@ def compare_pkda(baseline, args):
     values = make_pkda_inputs(args.batch, args.length)
     do = torch.randn_like(values['v']) * .01
     expected = pkda_call(baseline, values, do)
+    baseline_tuning = {direction: tuning_result(state_kernel(baseline, direction)) for direction in ('forward', 'backward')}
+    baseline_inputs = {name: value.detach().clone().requires_grad_() for name, value in values.items()}
+    candidate_inputs = {name: value.detach().clone().requires_grad_() for name, value in values.items()}
+    runners = {
+        'baseline': partial(pkda_call, baseline, baseline_inputs, do, prepared=True),
+        'candidate': partial(pkda_call, state_ops, candidate_inputs, do, prepared=True),
+    }
     with ExitStack() as stack:
         if args.fwd_config:
             stack.enter_context(force_config(state_ops.chunk_gated_delta_rule_fwd_kernel_h_blockdim64, args.fwd_config))
         if args.bwd_config:
             stack.enter_context(force_config(state_ops.chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64, args.bwd_config))
         actual = pkda_call(state_ops, values, do)
-    differences = errors(expected, actual, ('output', *('d_' + name for name in values)))
-    print(json.dumps(dict(mode='full_pkda_parity', batch=args.batch, length=args.length, differences=differences)), flush=True)
+        candidate_tuning = {direction: tuning_result(state_kernel(state_ops, direction)) for direction in ('forward', 'backward')}
+        differences = errors(expected, actual, ('output', *('d_' + name for name in values)))
+        print(json.dumps(dict(
+            mode='full_pkda_parity', batch=args.batch, length=args.length, differences=differences,
+            tuning=dict(baseline=baseline_tuning, candidate=candidate_tuning),
+        )), flush=True)
+        del expected, actual
+        for order in (('baseline', 'candidate'), ('candidate', 'baseline')):
+            timings = {variant: graph_time(runners[variant], args.replays, args.samples) for variant in order}
+            print(json.dumps(dict(
+                mode='full_pkda_runtime', batch=args.batch, length=args.length,
+                measured='forward_and_all_input_gradients_without_input_clones', order=order, **timings,
+            )), flush=True)
 
 
 def main():
@@ -258,6 +313,7 @@ def main():
     print(json.dumps(dict(
         device=torch.cuda.get_device_name(), torch=torch.__version__, triton=triton.__version__,
         base=args.base, batch=args.batch, length=args.length, heads=10, width=128, synthetic=True,
+        fla_cache_mode=cache_ops.FLA_CACHE_MODE.value,
     )), flush=True)
     with tempfile.TemporaryDirectory(prefix='round8-state-baseline-') as directory:
         baseline = load_baseline(args.base, directory)
