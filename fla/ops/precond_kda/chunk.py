@@ -417,8 +417,11 @@ class ChunkPrecondKDAFunction(torch.autograd.Function):
             assert disable_recompute is False, "return_intermediate_states must be used with disable_recompute=False"
             return o.to(q.dtype), final_state, at, h
 
-        # Don't save computed g when use_gate_in_kernel (will recompute in backward)
-        if use_gate_in_kernel:
+        # g, the fp32 chunk-local gate cumsum, is read by almost every backward
+        # kernel. When the forward's other intermediates are being kept anyway,
+        # keeping g too is cheaper than relaunching the 2560-CTA cumsum in the
+        # backward; when they are not, the 4 bytes per gate element matter more.
+        if use_gate_in_kernel and not disable_recompute:
             g = None
 
         # When disable_recompute=False (default), delete intermediates to save memory
@@ -457,8 +460,8 @@ class ChunkPrecondKDAFunction(torch.autograd.Function):
          w, u, kg, v_new, h,
          k_precond, ac_atk, a_atk, sa_atk) = ctx.saved_tensors
 
-        # Recompute g (cumsummed) if use_gate_in_kernel was used
-        if ctx.use_gate_in_kernel:
+        # Recompute g (cumsummed) only when the forward dropped it
+        if ctx.use_gate_in_kernel and g is None:
             g = kda_gate_chunk_cumsum(
                 g=g_org,
                 A_log=A_log,
