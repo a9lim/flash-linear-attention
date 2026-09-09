@@ -992,13 +992,17 @@ def chunk_gla_fwd_o_gk(
     B, T, H, K, HV, V = *q.shape, v.shape[2], v.shape[-1]
     BT = chunk_size
 
-    # ``qg`` is an optional [B, T, H, K] out-parameter for q * exp2(g), which
-    # this kernel already forms per K tile. One value head per query head is
-    # required (otherwise several programs would write one row from different
-    # gates), and so is a dense layout (a varlen graph launch skips chunks and
-    # would leave holes).
-    assert qg is None or (H == HV and cu_seqlens is None), \
-        "qg output needs H == HV and dense (non-varlen) input"
+    # ``qg`` is an optional out-parameter for q * exp2(g), which this kernel
+    # already forms per K tile. It must have q's shape, dtype and layout, since
+    # it is addressed with q's strides. It is filled by the i_v == 0 programs
+    # only, so V must be positive; one value head per query head is required
+    # (otherwise several programs would write one row from different gates);
+    # and so is a dense layout (a varlen graph launch skips chunks and would
+    # leave holes).
+    assert qg is None or (H == HV and cu_seqlens is None and V > 0), \
+        "qg output needs H == HV, dense (non-varlen) input and V > 0"
+    assert qg is None or (qg.shape == q.shape and qg.dtype == q.dtype and qg.stride() == q.stride()), \
+        "qg must match q in shape, dtype and layout"
 
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
