@@ -46,6 +46,7 @@ def chunk_precond_kda_fwd(
     eps: float = 1e-6,
     log_atk_scale: torch.Tensor = None,
     transpose_state_layout: bool = False,
+    output_qg: bool = False,
 ):
     """
     Forward pass for preconditioned KDA.
@@ -115,7 +116,10 @@ def chunk_precond_kda_fwd(
         state_v_first=transpose_state_layout,
     )
 
-    # Step 4: Output computation
+    # Step 4: Output computation. The output kernel already forms q * exp2(g)
+    # per K tile, so a backward that wants qg can have it here for one store
+    # instead of a 640-CTA pass of its own.
+    qg = torch.empty_like(q) if (output_qg and cu_seqlens is None) else None
     o = chunk_gla_fwd_o_gk(
         q=q,
         v=v_new,
@@ -127,9 +131,10 @@ def chunk_precond_kda_fwd(
         chunk_size=chunk_size,
         chunk_indices=chunk_indices,
         state_v_first=transpose_state_layout,
+        qg=qg,
     )
 
-    return o, Aqk, Akk, final_state, at, w, u, kg, v_new, h, k_precond, ac_atk, a_atk, sa_atk
+    return o, Aqk, Akk, final_state, at, w, u, kg, v_new, h, k_precond, ac_atk, a_atk, sa_atk, qg
 
 
 def chunk_precond_kda_bwd(
@@ -168,6 +173,7 @@ def chunk_precond_kda_bwd(
     ac_atk: torch.Tensor | None = None,
     a_atk: torch.Tensor | None = None,
     sa_atk: torch.Tensor | None = None,
+    qg: torch.Tensor | None = None,
 ):
     """
     Backward pass for preconditioned KDA with symmetric fast squash preconditioning.
@@ -204,8 +210,9 @@ def chunk_precond_kda_bwd(
             chunk_indices=chunk_indices,
             state_v_first=transpose_state_layout,
         )
-    else:
-        # Intermediates (w, u, kg, v_new, h) saved from forward; only need qg
+    elif qg is None:
+        # Intermediates (w, u, kg, v_new, h) saved from forward; only need qg,
+        # and the forward output kernel hands that over when it can.
         _, _, qg, _ = recompute_w_u_fwd(
             k=k,
             k_precond=k_precond,
@@ -388,7 +395,7 @@ class ChunkPrecondKDAFunction(torch.autograd.Function):
             )
 
         (o, Aqk, Akk, final_state, at, w, u, kg, v_new, h,
-         k_precond, ac_atk, a_atk, sa_atk) = chunk_precond_kda_fwd(
+         k_precond, ac_atk, a_atk, sa_atk, qg) = chunk_precond_kda_fwd(
             q=q,
             k=k,
             v=v,
@@ -410,6 +417,7 @@ class ChunkPrecondKDAFunction(torch.autograd.Function):
             eps=eps,
             log_atk_scale=log_atk_scale,
             transpose_state_layout=transpose_state_layout,
+            output_qg=disable_recompute,
         )
 
         if return_intermediate_states:
@@ -433,7 +441,7 @@ class ChunkPrecondKDAFunction(torch.autograd.Function):
             Aqk, Akk, initial_state,
             A_log, dt_bias, log_atk_scale, cu_seqlens, chunk_indices,
             w, u, kg, v_new, h,
-            k_precond, ac_atk, a_atk, sa_atk
+            k_precond, ac_atk, a_atk, sa_atk, qg
         )
         ctx.scale = scale
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
@@ -458,7 +466,7 @@ class ChunkPrecondKDAFunction(torch.autograd.Function):
          Aqk, Akk, initial_state,
          A_log, dt_bias, log_atk_scale, cu_seqlens, chunk_indices,
          w, u, kg, v_new, h,
-         k_precond, ac_atk, a_atk, sa_atk) = ctx.saved_tensors
+         k_precond, ac_atk, a_atk, sa_atk, qg) = ctx.saved_tensors
 
         # Recompute g (cumsummed) only when the forward dropped it
         if ctx.use_gate_in_kernel and g is None:
@@ -514,6 +522,7 @@ class ChunkPrecondKDAFunction(torch.autograd.Function):
             ac_atk=ac_atk,
             a_atk=a_atk,
             sa_atk=sa_atk,
+            qg=qg,
         )
 
         if ctx.use_qk_l2norm_in_kernel:

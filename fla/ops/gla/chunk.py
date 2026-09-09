@@ -330,6 +330,7 @@ def chunk_gla_fwd_A_kernel_intra_sub_intra_merge(
 
 @triton.heuristics({
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+    'STORE_QG': lambda args: args['qg'] is not None,
 })
 @fla_cache_autotune(
     configs=[
@@ -349,6 +350,7 @@ def chunk_gla_fwd_kernel_o(
     g,
     h,
     o,
+    qg,
     A,
     cu_seqlens,
     chunk_indices,
@@ -363,6 +365,7 @@ def chunk_gla_fwd_kernel_o(
     BV: tl.constexpr,
     STATE_V_FIRST: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    STORE_QG: tl.constexpr = False,
     USE_GRAPH: tl.constexpr = False,
 ):
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1).to(tl.int64), tl.program_id(2)
@@ -418,6 +421,12 @@ def chunk_gla_fwd_kernel_o(
         b_g = tl.load(p_g, mask=m_qk, other=0.0).to(tl.float32)
         # [BT, BK]
         b_qg = (b_q * exp2(b_g)).to(b_q.dtype)
+        if STORE_QG and i_v == 0:
+            # The gated query a backward would otherwise rebuild in its own
+            # pass is already in registers here. Only the first value tile
+            # stores it; every tile computes the same value.
+            p_qg = qg + (bos * H + i_h) * K + o_t[:, None] * (H*K) + o_k[None, :]
+            tl.store(p_qg, b_qg, mask=m_qk)
         b_h = tl.load(p_h, mask=m_h, other=0.0)
         if i_k >= 0:
             if STATE_V_FIRST:
@@ -978,9 +987,18 @@ def chunk_gla_fwd_o_gk(
     chunk_size: int = 64,
     chunk_indices: torch.LongTensor | None = None,
     use_graph: bool = False,
+    qg: torch.Tensor | None = None,
 ):
     B, T, H, K, HV, V = *q.shape, v.shape[2], v.shape[-1]
     BT = chunk_size
+
+    # ``qg`` is an optional [B, T, H, K] out-parameter for q * exp2(g), which
+    # this kernel already forms per K tile. One value head per query head is
+    # required (otherwise several programs would write one row from different
+    # gates), and so is a dense layout (a varlen graph launch skips chunks and
+    # would leave holes).
+    assert qg is None or (H == HV and cu_seqlens is None), \
+        "qg output needs H == HV and dense (non-varlen) input"
 
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
@@ -995,6 +1013,7 @@ def chunk_gla_fwd_o_gk(
         g=g,
         h=h,
         o=o,
+        qg=qg,
         A=A,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
