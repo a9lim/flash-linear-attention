@@ -49,7 +49,7 @@ else:
     configs=[
         triton.Config({'BV': BV}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in GATED_DELTA_RULE_FWD_H_NUM_WARPS
-        for num_stages in ([2, 3, 4] if check_shared_mem('ampere') else [2, 1])
+        for num_stages in ([2, 3, 4] if check_shared_mem('ampere') else [1, 2, 3] if check_shared_mem('ada') else [2, 1])
         for BV in ([32, 64] if check_shared_mem('ada') else [32])
     ],
     key=['H', 'HV', 'K', 'V', 'BT', 'STATE_V_FIRST'],
@@ -360,7 +360,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     configs=[
         triton.Config({'BV': BV}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [2, 4]
-        for num_stages in ([2, 3, 4] if check_shared_mem('ampere') else [1])
+        for num_stages in ([2, 3, 4] if check_shared_mem('ampere') else [1, 2, 3] if check_shared_mem('ada') else [1])
         for BV in ([32, 64] if check_shared_mem('ada') else [32])
     ],
     key=['H', 'HV', 'K', 'V', 'BT', 'BV', 'USE_G', 'STATE_V_FIRST'],
