@@ -136,7 +136,10 @@ def chunk_precond_kda_bwd_dAv(
     BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
-    dA = v.new_empty(B, T, H, BT, dtype=torch.float)
+    # dA is written once and read back only by the intra backward, which casts
+    # every load to fp32 before it is used; the activation dtype halves that
+    # buffer and the ~5x amplified reads the intra kernel makes of it.
+    dA = v.new_empty(B, T, H, BT)
     dv = torch.empty_like(do)
     grid = (NT, B * H)
     chunk_precond_kda_bwd_kernel_dAv[grid](
@@ -474,7 +477,7 @@ def chunk_precond_kda_bwd_wy_dqkg(
     dv2 = torch.empty_like(v)
     dg = torch.empty_like(g, dtype=torch.float)
     db = torch.empty_like(beta, dtype=torch.float)
-    dA = torch.empty_like(A, dtype=torch.float)
+    dA = torch.empty_like(A)
 
     grid = (NT, B * H)
     chunk_precond_kda_bwd_kernel_wy_dqkg[grid](
