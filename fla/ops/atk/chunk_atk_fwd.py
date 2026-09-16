@@ -26,6 +26,8 @@ import torch
 import triton
 import triton.language as tl
 
+from fla.utils import IS_NVIDIA_HOPPER
+
 
 @triton.heuristics({
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
@@ -321,6 +323,8 @@ def _atk_fwd_stages(
     CHUNK_LEN = chunk_size
 
     BK = D if os.environ.get('ATK_NO_KTILE') else 32  # K-tile size (set ATK_NO_KTILE=1 to disable)
+    # one full-width sweep avoids four serial walks through the chunks on Hopper
+    scan_bk = 128 if IS_NVIDIA_HOPPER and D == 128 else BK
 
     is_varlen = cu_seqlens is not None
 
@@ -386,7 +390,7 @@ def _atk_fwd_stages(
         a.stride(0), a.stride(1), a.stride(2), a.stride(3),
         sa.stride(0), sa.stride(1), sa.stride(2),
         ac.stride(0), ac.stride(1), ac.stride(2), ac.stride(3),
-        BK, num_warps=4
+        scan_bk, num_warps=4
     )
 
     _forward_chunk_out[grid](
