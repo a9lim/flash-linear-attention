@@ -181,6 +181,7 @@ def kda_gate_bwd_kernel(
     dyb,
     dg,
     dA,
+    dbias,
     dbeta,
     lower_bound,
     T,
@@ -238,6 +239,10 @@ def kda_gate_bwd_kernel(
     tl.store(p_dg, b_dg.to(p_dg.dtype.element_ty), mask=m_g)
     if HAS_A:
         tl.store(dA + i_t * H + i_h, b_dA)
+    if HAS_BIAS:
+        # The bias gradient sums dg over positions; the row tile's share is in
+        # registers already, so only one partial per tile reaches the reduction.
+        tl.store(dbias + (i_t * H + i_h) * BD + o_d, tl.sum(b_dg, 0), mask=o_d < D)
 
     if HAS_BETA:
         p_b = beta + i_h + o_t * H
@@ -304,6 +309,8 @@ def kda_gate_bwd(
 
     dg = torch.empty_like(g)
     dA = g.new_empty(NT, H, dtype=torch.float32) if A_log is not None else None
+    BD = triton.next_power_of_2(K)
+    dbias_tiles = g.new_empty(NT, H, BD, dtype=torch.float32) if dt_bias is not None else None
 
     grid = (triton.cdiv(T, BT), H)
     kda_gate_bwd_kernel[grid](
@@ -315,18 +322,19 @@ def kda_gate_bwd(
         dyb=None,
         dg=dg,
         dA=dA,
+        dbias=dbias_tiles,
         dbeta=None,
         T=T,
         H=H,
         D=K,
         BT=BT,
-        BD=triton.next_power_of_2(K),
+        BD=BD,
         lower_bound=lower_bound,
         REVERSE_CUMSUM=reverse_cumsum_chunk_size is not None,
     )
 
     dA = dA.sum(0).view_as(A_log).type_as(A_log) if A_log is not None else None
-    dbias = dg.view(-1, H * K).sum(0).to(dt_bias) if dt_bias is not None else None
+    dbias = dbias_tiles.sum(0)[:, :K].reshape(H * K).to(dt_bias) if dt_bias is not None else None
 
     return dg, dA, dbias
 
