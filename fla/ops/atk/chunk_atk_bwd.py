@@ -16,6 +16,21 @@ import triton.language as tl
 
 from fla.ops.utils import prepare_chunk_indices
 
+ATK_SCAN_STAGES = 4
+"""How far ahead the reverse chunk scan fetches.
+
+A sequence and head is one program, which leaves the launch far too narrow to
+cover memory latency with other programs, and the scan's loads depend only on
+their own chunk index, so the pipeline covers it instead.
+"""
+
+ATK_SCAN_BK = 32
+"""State width one reverse-scan program carries.
+
+The carry is elementwise in the state, so splitting it multiplies the
+launch's programs without changing what any of them computes.
+"""
+
 
 @triton.heuristics({
     'USE_INITIAL_STATE': lambda args: args['h0'] is not None,
@@ -199,28 +214,34 @@ def _atk_backward_chunk_out(
 })
 @triton.jit(do_not_specialize=['T'])
 def _atk_backward_pass_chunks(
-    sa, ac,               # forward buffers
+    sa,                   # forward buffer
     h0,                   # *f32 [N, H, D] or None - initial ATK state
     gac_from_out,         # grad entering each ac[i] from later usage
-    ga, gsa,              # outputs (+=)
+    ga,                   # output
     dh0,                  # *f32 [N, H, D] or None - gradient for initial ATK state (accumulated)
     cu_seqlens,           # *i32 [N+1] - cumulative sequence lengths
     B: tl.constexpr, T, H: tl.constexpr, D: tl.constexpr,
     CHUNK_LEN: tl.constexpr,
     sa_stride_b, sa_stride_c, sa_stride_h,
-    ac_stride_b, ac_stride_c, ac_stride_h, ac_stride_d,
     gac_stride_b, gac_stride_c, gac_stride_h, gac_stride_d,
     ga_stride_b, ga_stride_c, ga_stride_h, ga_stride_d,
-    gsa_stride_b, gsa_stride_c, gsa_stride_h,
     BLOCK_D: tl.constexpr,
+    SCAN_STAGES: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
+    """Sequential backward pass across chunks, one program per state slice of
+    a sequence and head.
+
+    The chunk-log-gate gradient this scan feeds is a cross-state reduction of
+    what the loop already stores, so it runs afterwards over every chunk at
+    once instead of on this loop's critical path. What is left is elementwise
+    in the state, which is why the state splits into ``BLOCK_D`` slices, and
+    crosses iterations only through the carry, so ``SCAN_STAGES`` fetches
+    chunks ahead of it.
     """
-    Sequential backward pass across chunks.
-    Not K-tiled due to cross-D reduction in gsa_val computation.
-    """
-    i_nh = tl.program_id(0).to(tl.int64)
+    i_k = tl.program_id(0).to(tl.int64)
+    i_nh = tl.program_id(1).to(tl.int64)
 
     if IS_VARLEN:
         i_n = i_nh // H
@@ -240,48 +261,98 @@ def _atk_backward_pass_chunks(
         return
 
     N_chunks = tl.cdiv(T, CHUNK_LEN)
-    D_range = tl.arange(0, BLOCK_D)
+    D_range = i_k * BLOCK_D + tl.arange(0, BLOCK_D)
     D_mask = D_range < D
 
-    sa_ptr = sa + b * sa_stride_b + h * sa_stride_h + (N_chunks - 1) * sa_stride_c
-    ac_ptr = ac + b * ac_stride_b + h * ac_stride_h + D_range * ac_stride_d + (N_chunks - 1) * ac_stride_c
-    gac_ptr = gac_from_out + b * gac_stride_b + h * gac_stride_h + D_range * gac_stride_d + (N_chunks - 1) * gac_stride_c
-    gsa_ptr = gsa + b * gsa_stride_b + h * gsa_stride_h + (N_chunks - 1) * gsa_stride_c
-    ga_ptr = ga + b * ga_stride_b + h * ga_stride_h + D_range * ga_stride_d + (N_chunks - 1) * ga_stride_c
+    sa_base = sa + b * sa_stride_b + h * sa_stride_h
+    gac_base = gac_from_out + b * gac_stride_b + h * gac_stride_h + D_range * gac_stride_d
+    ga_base = ga + b * ga_stride_b + h * ga_stride_h + D_range * ga_stride_d
 
     gac_val = tl.zeros([BLOCK_D], dtype=tl.float32)
 
-    for chunk_id in tl.range(N_chunks - 1, -1, -1):
-        gac_val += tl.load(gac_ptr, mask=D_mask)
+    for chunk_id in tl.range(N_chunks - 1, -1, -1, num_stages=SCAN_STAGES):
+        gac_val += tl.load(gac_base + chunk_id * gac_stride_c, mask=D_mask)
 
-        tl.store(ga_ptr, gac_val, mask=D_mask)
+        tl.store(ga_base + chunk_id * ga_stride_c, gac_val, mask=D_mask)
 
-        sa_val = tl.load(sa_ptr).to(tl.float32)
-
-        if chunk_id > 0:
-            ac_prev_ptr = ac + b * ac_stride_b + h * ac_stride_h + D_range * ac_stride_d + (chunk_id - 1) * ac_stride_c
-            ac_prev_val = tl.load(ac_prev_ptr, mask=D_mask)
-            gsa_val = tl.sum(gac_val * ac_prev_val) * tl.exp(sa_val)
-        else:
-            if USE_INITIAL_STATE:
-                h0_val = tl.load(h0 + i_nh * D + D_range, mask=D_mask, other=0).to(tl.float32)
-                gsa_val = tl.sum(gac_val * h0_val) * tl.exp(sa_val)
-            else:
-                gsa_val = 0.0
-
+        sa_val = tl.load(sa_base + chunk_id * sa_stride_c).to(tl.float32)
         gac_val = gac_val * tl.exp(sa_val)
-
-        tl.store(gsa_ptr, gsa_val)
-
-        sa_ptr -= sa_stride_c
-        ac_ptr -= ac_stride_c
-        gac_ptr -= gac_stride_c
-        ga_ptr -= ga_stride_c
-        gsa_ptr -= gsa_stride_c
 
     if USE_INITIAL_STATE:
         p_dh0 = dh0 + i_nh * D + D_range
         tl.store(p_dh0, tl.load(p_dh0, mask=D_mask, other=0).to(tl.float32) + gac_val, mask=D_mask)
+
+
+@triton.heuristics({
+    'USE_INITIAL_STATE': lambda args: args['h0'] is not None,
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+})
+@triton.jit(do_not_specialize=['T'])
+def _atk_backward_chunk_gate(
+    sa, ac,               # forward buffers
+    h0,                   # *f32 [N, H, D] or None - initial ATK state
+    ga,                   # the reverse scan's per-chunk carry
+    gsa,                  # output
+    cu_seqlens,           # *i32 [N+1] - cumulative sequence lengths
+    chunk_indices,        # *i32 [NT, 2] - (seq_idx, chunk_idx) pairs
+    B: tl.constexpr, T, H: tl.constexpr, D: tl.constexpr,
+    CHUNK_LEN: tl.constexpr,
+    sa_stride_b, sa_stride_c, sa_stride_h,
+    ac_stride_b, ac_stride_c, ac_stride_h, ac_stride_d,
+    ga_stride_b, ga_stride_c, ga_stride_h, ga_stride_d,
+    gsa_stride_b, gsa_stride_c, gsa_stride_h,
+    BLOCK_D: tl.constexpr,
+    USE_INITIAL_STATE: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+):
+    """The chunk-log-gate gradient the reverse scan leaves behind.
+
+    ``gsa[c]`` reduces ``ga[c]`` against the state entering chunk ``c``, which
+    the scan has already written, so every chunk is independent here.
+    """
+    i_t = tl.program_id(0)
+    h = tl.program_id(1)
+    chunk_id = tl.program_id(2).to(tl.int64)
+
+    if IS_VARLEN:
+        i_n = tl.load(chunk_indices + i_t * 2).to(tl.int32)
+        chunk_id = tl.load(chunk_indices + i_t * 2 + 1).to(tl.int64)
+        bos = tl.load(cu_seqlens + i_n).to(tl.int32)
+        eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        T = eos - bos
+        b = i_n.to(tl.int64)
+    else:
+        b = tl.program_id(0).to(tl.int64)
+        i_n = b
+
+    if h >= H:
+        return
+
+    if chunk_id * CHUNK_LEN >= T:
+        return
+
+    D_range = tl.arange(0, BLOCK_D)
+    D_mask = D_range < D
+
+    ga_val = tl.load(
+        ga + b * ga_stride_b + h * ga_stride_h + chunk_id * ga_stride_c + D_range * ga_stride_d,
+        mask=D_mask,
+        other=0.0,
+    )
+    if chunk_id > 0:
+        entering = tl.load(
+            ac + b * ac_stride_b + h * ac_stride_h + (chunk_id - 1) * ac_stride_c + D_range * ac_stride_d,
+            mask=D_mask,
+            other=0.0,
+        )
+    else:
+        # The first chunk enters from the initial state, or from nothing at all.
+        entering = tl.zeros([BLOCK_D], dtype=tl.float32)
+        if USE_INITIAL_STATE:
+            entering = tl.load(h0 + (i_n * H + h) * D + D_range, mask=D_mask, other=0).to(tl.float32)
+    sa_val = tl.load(sa + b * sa_stride_b + h * sa_stride_h + chunk_id * sa_stride_c).to(tl.float32)
+    gsa_ptr = gsa + b * gsa_stride_b + h * gsa_stride_h + chunk_id * gsa_stride_c
+    tl.store(gsa_ptr, tl.sum(ga_val * entering) * tl.exp(sa_val))
 
 
 @triton.heuristics({
@@ -516,10 +587,10 @@ def chunk_atk_bwd(
 
     if cu_seqlens is None:
         grid = (B, H, triton.cdiv(T, CHUNK_LEN))
-        grid2 = (B * H,)
+        grid2 = (triton.cdiv(K, ATK_SCAN_BK), B * H)
     else:
         grid = (NT, H, 1)
-        grid2 = (N * H,)
+        grid2 = (triton.cdiv(K, ATK_SCAN_BK), N * H)
 
     _atk_backward_chunk_out[grid](
         k, g_raw, beta, ac, initial_A_state, dk_precond,
@@ -541,16 +612,27 @@ def chunk_atk_bwd(
     )
 
     _atk_backward_pass_chunks[grid2](
-        sa, ac,
+        sa,
         initial_A_state,
         gac_prev,
-        ga, gsa,
+        ga,
         dh0,
         cu_seqlens,
         B, T, H, K, CHUNK_LEN,
         sa.stride(0), sa.stride(1), sa.stride(2),
-        ac.stride(0), ac.stride(1), ac.stride(2), ac.stride(3),
         gac_prev.stride(0), gac_prev.stride(1), gac_prev.stride(2), gac_prev.stride(3),
+        ga.stride(0), ga.stride(1), ga.stride(2), ga.stride(3),
+        min(BLOCK_D, ATK_SCAN_BK), SCAN_STAGES=ATK_SCAN_STAGES, num_warps=4
+    )
+
+    _atk_backward_chunk_gate[grid](
+        sa, ac,
+        initial_A_state,
+        ga, gsa,
+        cu_seqlens, chunk_indices,
+        B, T, H, K, CHUNK_LEN,
+        sa.stride(0), sa.stride(1), sa.stride(2),
+        ac.stride(0), ac.stride(1), ac.stride(2), ac.stride(3),
         ga.stride(0), ga.stride(1), ga.stride(2), ga.stride(3),
         gsa.stride(0), gsa.stride(1), gsa.stride(2),
         BLOCK_D, num_warps=4
