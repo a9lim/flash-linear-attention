@@ -263,7 +263,8 @@ def causal_conv1d_bwd(
             BT = 32
         NT = triton.cdiv(T, BT)
         dx = torch.empty_like(x)
-        dw = weight.new_empty(B*NT, *weight.shape, dtype=torch.float)
+        # [tile, W, D]: a tap's channel row is one contiguous store.
+        dw = weight.new_empty(B*NT, W, D, dtype=torch.float)
         db = bias.new_empty(B*NT, *bias.shape, dtype=torch.float) if bias is not None else None
         stride_dx_n, stride_dx_t, stride_dx_d = dx.stride()
         off = 0
@@ -298,7 +299,7 @@ def causal_conv1d_bwd(
                 ACTIVATION=activation,
             )
             off += w
-        dw = dw.sum(0).to(weight)
+        dw = dw.sum(0).transpose(0, 1).contiguous().to(weight)
         if db is not None:
             db = db.sum(0).to(bias)
         dr = dy if residual is not None else None
