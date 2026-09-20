@@ -20,6 +20,11 @@ NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
 # tile trades shared memory for traffic; it owns its own list and drops the
 # configs the target cannot fit.
 WY_BV_LIST = sorted(set(BV_LIST + [64, 128]))
+# Hopper's WY/inter backward optimum is one of the two launches the shared warp
+# list and the narrow-tile exclusion used to hide: BK=32 at four warps, and
+# eight warps at BK=64. Both beat every config the old space allowed, so the
+# kernel owns its warp list and carries no exclusion.
+WY_NUM_WARPS = [2, 4, 8]
 
 
 # ==============================================================================
@@ -164,9 +169,8 @@ def chunk_precond_kda_bwd_dAv(
         triton.Config({'BK': BK, 'BV': BV}, num_warps=num_warps, num_stages=num_stages)
         for BK in BK_LIST
         for BV in WY_BV_LIST
-        for num_warps in NUM_WARPS
+        for num_warps in WY_NUM_WARPS
         for num_stages in [2, 3, 4]
-        if not (IS_NVIDIA_HOPPER and BK == 32 and num_warps == 4)
     ],
     key=['BT', 'TRANSPOSE_STATE', 'K', 'V'],
     **autotune_cache_kwargs,
