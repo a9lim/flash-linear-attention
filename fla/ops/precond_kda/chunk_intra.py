@@ -25,12 +25,16 @@ DEFAULT_SOLVE_TRIL_PRECISION = 'tf32x3' if IS_TF32_SUPPORTED else 'ieee'
 
 @triton.heuristics({
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+    # A 128-wide key tile shortens the loop but holds more of the transposed
+    # column side in registers, and runs the whole PKDA pass 1.01x slower on an
+    # H100 PCIe at the screen shape.
     'BK': lambda args: min(triton.next_power_of_2(args['K']), 64),
 })
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=num_warps)
+        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [1, 2, 4]
+        for num_stages in [2, 3, 4]
     ],
     key=["H", "K", "BC"],
     **autotune_cache_kwargs,
@@ -273,26 +277,29 @@ def chunk_precond_kda_fwd_kernel_inter_solve_fused(
         b_Ai22 = -tl.where(m_A, b_Ai22, 0)
         b_Ai33 = -tl.where(m_A, b_Ai33, 0)
 
-        for i in range(2, min(BC, T - i_tc0)):
-            b_a00 = -tl.load(Akk_diag + (i_tc0 + i) * H*BC + o_i)
-            b_a00 = tl.where(o_i < i, b_a00, 0.)
+        # The four diagonal blocks substitute independently, so one static
+        # sweep over the sub-chunk rows carries all four at once and the row
+        # each block is past stays as it was. A block's own row bound rides
+        # along as a mask instead of shortening a loop of its own.
+        for i in range(2, BC):
+            m_r0 = i < T - i_tc0
+            m_r1 = i < T - i_tc1
+            m_r2 = i < T - i_tc2
+            m_r3 = i < T - i_tc3
+            m_row = o_i < i
+            b_a00 = tl.where(m_row, -tl.load(Akk_diag + (i_tc0 + i) * H*BC + o_i, mask=m_r0, other=0.), 0.)
+            b_a11 = tl.where(m_row, -tl.load(Akk_diag + (i_tc1 + i) * H*BC + o_i, mask=m_r1, other=0.), 0.)
+            b_a22 = tl.where(m_row, -tl.load(Akk_diag + (i_tc2 + i) * H*BC + o_i, mask=m_r2, other=0.), 0.)
+            b_a33 = tl.where(m_row, -tl.load(Akk_diag + (i_tc3 + i) * H*BC + o_i, mask=m_r3, other=0.), 0.)
             b_a00 += tl.sum(b_a00[:, None] * b_Ai00, 0)
-            b_Ai00 = tl.where((o_i == i)[:, None], b_a00, b_Ai00)
-        for i in range(BC + 2, min(2*BC, T - i_tc0)):
-            b_a11 = -tl.load(Akk_diag + (i_tc0 + i) * H*BC + o_i)
-            b_a11 = tl.where(o_i < i - BC, b_a11, 0.)
             b_a11 += tl.sum(b_a11[:, None] * b_Ai11, 0)
-            b_Ai11 = tl.where((o_i == i - BC)[:, None], b_a11, b_Ai11)
-        for i in range(2*BC + 2, min(3*BC, T - i_tc0)):
-            b_a22 = -tl.load(Akk_diag + (i_tc0 + i) * H*BC + o_i)
-            b_a22 = tl.where(o_i < i - 2*BC, b_a22, 0.)
             b_a22 += tl.sum(b_a22[:, None] * b_Ai22, 0)
-            b_Ai22 = tl.where((o_i == i - 2*BC)[:, None], b_a22, b_Ai22)
-        for i in range(3*BC + 2, min(4*BC, T - i_tc0)):
-            b_a33 = -tl.load(Akk_diag + (i_tc0 + i) * H*BC + o_i)
-            b_a33 = tl.where(o_i < i - 3*BC, b_a33, 0.)
             b_a33 += tl.sum(b_a33[:, None] * b_Ai33, 0)
-            b_Ai33 = tl.where((o_i == i - 3*BC)[:, None], b_a33, b_Ai33)
+            m_set = (o_i == i)[:, None]
+            b_Ai00 = tl.where(m_set & m_r0, b_a00, b_Ai00)
+            b_Ai11 = tl.where(m_set & m_r1, b_a11, b_Ai11)
+            b_Ai22 = tl.where(m_set & m_r2, b_a22, b_Ai22)
+            b_Ai33 = tl.where(m_set & m_r3, b_a33, b_Ai33)
 
         b_Ai00 += m_I
         b_Ai11 += m_I
