@@ -12,10 +12,10 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from fla.ops.backends import dispatch
+from fla.backends import dispatch
 from fla.ops.utils.cache import fla_cache_autotune
 from fla.ops.utils.index import prepare_chunk_indices
-from fla.ops.utils.op import exp
+from fla.ops.utils.op import exp, unflatten_program_id
 from fla.ops.utils.softplus import softplus
 from fla.utils import IS_AMD, autocast_custom_bwd, autocast_custom_fwd, autotune_cache_kwargs, check_shared_mem, input_guard
 
@@ -128,7 +128,7 @@ def kda_gate_fwd_kernel(
     HAS_BETA: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
 ):
-    i_t, i_h = tl.program_id(0).to(tl.int64), tl.program_id(1)
+    i_t, i_h = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
 
     b_A = tl.load(A_log + i_h).to(tl.float32) if HAS_A else 1.0
 
@@ -195,7 +195,7 @@ def kda_gate_bwd_kernel(
     USE_LOWER_BOUND: tl.constexpr,
     REVERSE_CUMSUM: tl.constexpr,
 ):
-    i_t, i_h = tl.program_id(0).to(tl.int64), tl.program_id(1)
+    i_t, i_h = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
 
     b_A = tl.load(A_log + i_h).to(tl.float32) if HAS_A else 1.0
 
@@ -242,7 +242,7 @@ def kda_gate_bwd_kernel(
     if HAS_BIAS:
         # The bias gradient sums dg over positions; the row tile's share is in
         # registers already, so only one partial per tile reaches the reduction.
-        tl.store(dbias + (i_t * H + i_h) * BD + o_d, tl.sum(b_dg, 0), mask=o_d < D)
+        tl.store(dbias + (i_t * H + i_h) * D + o_d, tl.sum(b_dg, 0), mask=o_d < D)
 
     if HAS_BETA:
         p_b = beta + i_h + o_t * H
@@ -309,11 +309,9 @@ def kda_gate_bwd(
 
     dg = torch.empty_like(g)
     dA = g.new_empty(NT, H, dtype=torch.float32) if A_log is not None else None
-    BD = triton.next_power_of_2(K)
-    dbias_tiles = g.new_empty(NT, H, BD, dtype=torch.float32) if dt_bias is not None else None
+    dbias = g.new_empty(NT, H * K, dtype=torch.float32) if dt_bias is not None else None
 
-    grid = (triton.cdiv(T, BT), H)
-    kda_gate_bwd_kernel[grid](
+    kda_gate_bwd_kernel[(NT, H)](
         g=g,
         A_log=A_log,
         dt_bias=dt_bias,
@@ -322,19 +320,19 @@ def kda_gate_bwd(
         dyb=None,
         dg=dg,
         dA=dA,
-        dbias=dbias_tiles,
+        dbias=dbias,
         dbeta=None,
         T=T,
         H=H,
         D=K,
         BT=BT,
-        BD=BD,
+        BD=triton.next_power_of_2(K),
         lower_bound=lower_bound,
         REVERSE_CUMSUM=reverse_cumsum_chunk_size is not None,
     )
 
     dA = dA.sum(0).view_as(A_log).type_as(A_log) if A_log is not None else None
-    dbias = dbias_tiles.sum(0)[:, :K].reshape(H * K).to(dt_bias) if dt_bias is not None else None
+    dbias = dbias.sum(0).to(dt_bias) if dt_bias is not None else None
 
     return dg, dA, dbias
 
@@ -447,7 +445,8 @@ def kda_gate_chunk_cumsum_vector_kernel(
     USE_LOWER_BOUND: tl.constexpr,
     USE_GRAPH: tl.constexpr = False,
 ):
-    i_s, i_t, i_bh = tl.program_id(0), tl.program_id(1).to(tl.int64), tl.program_id(2).to(tl.int64)
+    i_s, i_t = unflatten_program_id(tl.cdiv(S, BS))
+    i_bh = tl.program_id(1).to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
         i_n = tl.load(chunk_indices + i_t * 2).to(tl.int32)
@@ -515,13 +514,16 @@ def kda_gate_chunk_cumsum(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     assert chunk_size == 2**(chunk_size.bit_length()-1), "chunk_size must be a power of 2"
 
-    g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
-    def grid(meta): return (triton.cdiv(meta['S'], meta['BS']), NT, B * H)
+    o = torch.empty_like(g, dtype=output_dtype or g.dtype)
+
+    def grid(meta):
+        return (triton.cdiv(meta['S'], meta['BS']) * NT, B * H)
+
     kda_gate_chunk_cumsum_vector_kernel[grid](
-        s=g_org,
+        s=g,
         A_log=A_log,
         dt_bias=dt_bias,
-        o=g,
+        o=o,
         scale=scale,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
@@ -533,4 +535,4 @@ def kda_gate_chunk_cumsum(
         REVERSE=False,
         USE_GRAPH=use_graph,
     )
-    return g
+    return o

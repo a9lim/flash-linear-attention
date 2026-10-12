@@ -54,8 +54,8 @@ def _forward_chunk_summary(
     BK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
-    i_t = tl.program_id(0)
-    h = tl.program_id(1)
+    i_t = tl.program_id(0).to(tl.int64)
+    h = tl.program_id(1).to(tl.int64)
     chunk_id = tl.program_id(2).to(tl.int64)
 
     if IS_VARLEN:
@@ -216,8 +216,8 @@ def _forward_chunk_out(
     USE_INITIAL_STATE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
-    i_t = tl.program_id(0)
-    h = tl.program_id(1)
+    i_t = tl.program_id(0).to(tl.int64)
+    h = tl.program_id(1).to(tl.int64)
     chunk_id = tl.program_id(2).to(tl.int64)
 
     if IS_VARLEN:

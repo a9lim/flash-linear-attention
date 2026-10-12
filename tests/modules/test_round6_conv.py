@@ -9,7 +9,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from fla.modules.conv import causal_conv1d
+from fla.modules.causal_conv1d import causal_conv1d
 from fla.utils import assert_close, device
 
 

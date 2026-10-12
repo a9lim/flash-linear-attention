@@ -20,7 +20,7 @@ from pathlib import Path
 import torch
 import triton
 
-from fla.modules.conv.triton import ops
+from fla.modules.causal_conv1d import ops
 from fla.utils import assert_close
 
 
@@ -124,8 +124,13 @@ def benchmark(args, baseline_ops):
 
             def full_body(kernel, mode, backward_tile):
                 wrapper = baseline_ops if kernel is baseline else ops
-                forward = wrapper.causal_conv1d_fwd(**common, BT=args.forward_tile) if mode != 'backward' else None
-                backward = wrapper.causal_conv1d_bwd(**common, dy=dys, dht=None, BT=backward_tile) if mode != 'forward' else None
+                # the frozen baseline predates the move to fla.modules.causal_conv1d and its chunk_size keyword
+                tile = 'BT' if kernel is baseline else 'chunk_size'
+                forward = backward = None
+                if mode != 'backward':
+                    forward = wrapper.causal_conv1d_fwd(**common, **{tile: args.forward_tile})
+                if mode != 'forward':
+                    backward = wrapper.causal_conv1d_bwd(**common, dy=dys, dht=None, **{tile: backward_tile})
                 return forward, backward
 
             reference = full_body(baseline, 'forward_backward', baseline_tile)
@@ -180,6 +185,7 @@ def benchmark(args, baseline_ops):
                             }
                             for item in compiled
                         ])
+
                         def body(kernel=kernel, storage=storage, tile=tile):
                             return kernel_body(kernel, storage, tile)
                     else:
