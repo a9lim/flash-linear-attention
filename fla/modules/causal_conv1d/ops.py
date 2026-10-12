@@ -932,6 +932,23 @@ def _split_widths(
     return tuple(split_outputs)
 
 
+def _fused_kwargs(
+    l2norm_head_dim: int | None,
+    l2norm_channels: int | None,
+    l2norm_eps: float,
+    split_outputs: tuple[int, ...] | None,
+) -> dict:
+    """Keywords for the fused L2-norm/split path, empty when the call is a plain convolution."""
+    if l2norm_head_dim is None and split_outputs is None:
+        return {}
+    return {
+        "l2norm_head_dim": l2norm_head_dim,
+        "l2norm_channels": l2norm_channels,
+        "l2norm_eps": l2norm_eps,
+        "split_outputs": split_outputs,
+    }
+
+
 def _l2norm_geometry(
     D: int,
     l2norm_head_dim: int,
@@ -1409,7 +1426,9 @@ class CausalConv1dFunction(torch.autograd.Function):
         ctx.cu_seqlens_cpu = cu_seqlens_cpu
         ctx.chunk_indices = chunk_indices
         ctx.layout_fallback = _has_non_standard_layout(x=x)
-        ctx.l2norm = (l2norm_head_dim, l2norm_channels, l2norm_eps)
+        # Only fused calls carry the fused keywords, so plain calls keep upstream's
+        # signature and stay eligible for every registered backend.
+        ctx.fused = _fused_kwargs(l2norm_head_dim, l2norm_channels, l2norm_eps, split_outputs)
         ctx.split_outputs = split_outputs
         ctx.save_for_backward(x, weight, bias, residual, initial_state)
         y, final_state = causal_conv1d_fwd(
@@ -1425,10 +1444,7 @@ class CausalConv1dFunction(torch.autograd.Function):
             chunk_indices=chunk_indices,
             chunk_size=chunk_size,
             layout_fallback=ctx.layout_fallback,
-            l2norm_head_dim=l2norm_head_dim,
-            l2norm_channels=l2norm_channels,
-            l2norm_eps=l2norm_eps,
-            split_outputs=split_outputs,
+            **ctx.fused,
         )
         if split_outputs is not None:
             return (*y, final_state)
@@ -1444,7 +1460,6 @@ class CausalConv1dFunction(torch.autograd.Function):
             dy, dht = grads[0], grads[1] if len(grads) > 1 else None
             dht = dht.contiguous() if isinstance(dht, torch.Tensor) else dht
         x, weight, bias, residual, initial_state = ctx.saved_tensors
-        l2norm_head_dim, l2norm_channels, l2norm_eps = ctx.l2norm
         dx, dw, db, dr, dh0 = causal_conv1d_bwd(
             x=x,
             dy=dy,
@@ -1458,10 +1473,7 @@ class CausalConv1dFunction(torch.autograd.Function):
             cu_seqlens_cpu=ctx.cu_seqlens_cpu,
             chunk_indices=ctx.chunk_indices,
             layout_fallback=ctx.layout_fallback,
-            l2norm_head_dim=l2norm_head_dim,
-            l2norm_channels=l2norm_channels,
-            l2norm_eps=l2norm_eps,
-            split_outputs=ctx.split_outputs,
+            **ctx.fused,
         )
         return dx, dw, db, dr, dh0, None, None, None, None, None, None, None, None, None, None
 
