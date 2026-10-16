@@ -23,7 +23,11 @@ def naive_recurrent_precond_kda(
     x: float = 1.5,
     eps: float = 1e-6,
     log_atk_scale: torch.Tensor | float = None,
+    normalize_beta: bool = False,
 ):
+    """With ``normalize_beta``, ``beta`` is the fraction of the error corrected at the
+    read key: the write step is ``beta / (k . k_precond)``, so one update leaves
+    ``S^T k = (1 - beta) S^T k + beta v``."""
     dtype = v.dtype
     B, T, H, K, V = *q.shape, v.shape[-1]
     if scale is None:
@@ -65,6 +69,9 @@ def naive_recurrent_precond_kda(
         s = r / (1.0 + torch.abs(r))
         M = torch.exp(-logx * s)
         k_precond = k_i * M
+
+        if normalize_beta:
+            beta_i = beta_i / (k_i * k_precond).sum(-1)
 
         S = S * g_i[..., None].exp()
         S = S + torch.einsum('b h k, b h v -> b h k v', beta_i[..., None] * k_precond, v_i - (k_i[..., None] * S).sum(-2))

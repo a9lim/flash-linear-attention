@@ -200,6 +200,7 @@ def _forward_pass_chunks(
 @triton.heuristics({
     'USE_INITIAL_STATE': lambda args: args['h0'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+    'STORE_KAPPA': lambda args: args['kappa'] is not None,
 })
 @triton.jit(do_not_specialize=['T'])
 def _forward_chunk_out(
@@ -209,6 +210,7 @@ def _forward_chunk_out(
     ac,               # *f32 [B, C, H, D]
     h0,               # *f32 [N, H, D] or None
     k_precond,        # *f32 [B, T, H, D]
+    kappa,            # *f32 [B, T, H] contiguous, or None - k . k_precond per token
     log_atk_scale,    # *f32 [H] - per-head log-space center (learnable or fixed)
     logx,             # scalar float32 - log(x) for squash range
     eps,              # scalar float32 - epsilon for log safety
@@ -227,6 +229,7 @@ def _forward_chunk_out(
     BK: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    STORE_KAPPA: tl.constexpr,
 ):
     i_t = tl.program_id(0).to(tl.int64)
     h = tl.program_id(1).to(tl.int64)
@@ -274,6 +277,9 @@ def _forward_chunk_out(
     carry_decays = tl.exp(la_cumsum)
 
     center = tl.load(log_atk_scale + h).to(tl.float32)
+    # The key energy under the preconditioner, summed over the state tiles in
+    # FP32 before k_precond is narrowed to the key's dtype.
+    kappa_val = tl.zeros([CHUNK_LEN], dtype=tl.float32)
 
     for i_k in range(tl.cdiv(D, BK)):
         d_offset = i_k * BK
@@ -310,8 +316,17 @@ def _forward_chunk_out(
         s = r / (1.0 + tl.abs(r))
         M_precond = tl.exp(-logx * s)
         k_precond_val = k_val * M_precond
+        if STORE_KAPPA:
+            kappa_val += tl.sum(k_val * k_precond_val, 1)
 
         tl.store(kp_ptr, k_precond_val, mask=mask_T[:, None] * mask_D[None, :])
+
+    if STORE_KAPPA:
+        if IS_VARLEN:
+            kappa_ptr = kappa + (bos + T_range) * H + h
+        else:
+            kappa_ptr = kappa + (b * T + T_range) * H + h
+        tl.store(kappa_ptr, kappa_val, mask=mask_T)
 
 
 def _atk_fwd_stages(
@@ -325,6 +340,7 @@ def _atk_fwd_stages(
     x: float,
     eps: float,
     log_atk_scale: torch.Tensor | None,
+    kappa: torch.Tensor | None = None,
 ):
     """Run the 3-stage ATK forward algorithm.
 
@@ -404,8 +420,10 @@ def _atk_fwd_stages(
         scan_bk, SCAN_STAGES=ATK_SCAN_STAGES, num_warps=4
     )
 
+    if kappa is not None:
+        assert kappa.shape == k.shape[:3] and kappa.dtype == torch.float32 and kappa.is_contiguous()
     _forward_chunk_out[grid](
-        k, beta, log_g, ac, initial_A_state, k_precond,
+        k, beta, log_g, ac, initial_A_state, k_precond, kappa,
         log_atk_scale, logx, eps,
         cu_seqlens, chunk_indices,
         B, T, H, D, CHUNK_LEN,
@@ -444,17 +462,21 @@ def chunk_atk_fwd(
     x: float = 1.5,
     eps: float = 1e-6,
     log_atk_scale: torch.Tensor = None,
+    kappa: torch.Tensor = None,
 ):
     r"""
     Chunked ATK forward: computes preconditioned keys via 3-stage chunk algorithm.
 
     Returns ``(k_precond, ac, a, sa, at)``; the scan buffers let a caller keep the
-    forward products for the backward pass instead of recomputing them.
+    forward products for the backward pass instead of recomputing them. A
+    contiguous FP32 ``kappa`` buffer of shape ``[B, T, H]``, when given,
+    receives each token's ``k . k_precond`` in FP32, before ``k_precond`` is
+    narrowed to the key's dtype.
     """
     return _atk_fwd_stages(
         k, beta, log_g, chunk_size,
         initial_A_state, output_final_state, cu_seqlens,
-        x, eps, log_atk_scale,
+        x, eps, log_atk_scale, kappa,
     )
 
 

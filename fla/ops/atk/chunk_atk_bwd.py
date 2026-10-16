@@ -22,6 +22,7 @@ from fla.ops.utils import prepare_chunk_indices
 @triton.heuristics({
     'USE_INITIAL_STATE': lambda args: args['h0'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+    'HAS_DKAPPA': lambda args: args['dkappa'] is not None,
 })
 @triton.jit(do_not_specialize=['T'])
 def _atk_backward_chunk_out(
@@ -31,6 +32,7 @@ def _atk_backward_chunk_out(
     ac,               # *f32 [B, C, H, D]  (forward prefix contexts)
     h0,               # *f32 [N, H, D] or None - initial ATK state
     g_kp,             # *f32 [B, T, H, D]  upstream grad on k_precond
+    dkappa,           # *f32 [B, T, H] contiguous, or None - grad on kappa = k . k_precond
     # outputs (accumulators; +=)
     gk_out,           # *f32 [B, T, H, D]
     gg_out,           # *f32 [B, T, H]
@@ -57,6 +59,7 @@ def _atk_backward_chunk_out(
     BK: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    HAS_DKAPPA: tl.constexpr,
 ):
     """
     Per-chunk backward kernel for ATK. K-tiled variant.
@@ -116,6 +119,13 @@ def _atk_backward_chunk_out(
     gbeta_val = tl.zeros([CHUNK_LEN], dtype=tl.float32)
     g_center = tl.zeros([], dtype=tl.float32)
 
+    if HAS_DKAPPA:
+        if IS_VARLEN:
+            dkappa_ptr = dkappa + (bos + T_range) * H + h
+        else:
+            dkappa_ptr = dkappa + (b * T + T_range) * H + h
+        dkappa_val = tl.load(dkappa_ptr, mask=mask_T, other=0.0)
+
     for i_k in range(tl.cdiv(D, BK)):
         d_offset = i_k * BK
         D_range = d_offset + tl.arange(0, BK)
@@ -154,7 +164,14 @@ def _atk_backward_chunk_out(
         ds_dr = 1.0 / (one_plus_abs_r * one_plus_abs_r)
         M_mult = tl.exp(-logx * s)
 
+        if HAS_DKAPPA:
+            # kappa = sum(M * k^2): its gradient reaches M through k_precond
+            # (gkp += dkappa * k) and k directly through 2 * M * k, one of whose
+            # halves the k_precond route already carries.
+            gkp_val += dkappa_val[:, None] * k_val
         gk_val = gkp_val * M_mult
+        if HAS_DKAPPA:
+            gk_val += dkappa_val[:, None] * k_val * M_mult
         gM_from_kprecond = gkp_val * k_val
         gs = gM_from_kprecond * (-logx * M_mult)
 
@@ -492,6 +509,7 @@ def chunk_atk_bwd(
     log_atk_scale: torch.Tensor = None,
     dat: torch.Tensor | None = None,
     dk_intra: torch.Tensor | None = None,
+    dkappa: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     r"""
     ATK backward pass. Takes precomputed forward intermediates from ``recompute_atk_fwd``.
@@ -514,6 +532,8 @@ def chunk_atk_bwd(
         dk_intra: Caller-owned ``[B, T, H, K]`` buffer in ``k.dtype`` holding the
             non-ATK part of dk. When given it is accumulated into in place and
             returned as the total, so the caller needs no separate add or cast.
+        dkappa: Incoming gradient w.r.t. ``chunk_atk_fwd``'s ``kappa``, a
+            contiguous FP32 ``[B, T, H]`` tensor, or ``None``.
 
     Returns:
         dk_atk: Gradient contribution to k ``[B, T, H, K]`` (the total when
@@ -580,8 +600,10 @@ def chunk_atk_bwd(
         grid = (NT, H, 1)
         grid2 = (triton.cdiv(K, ATK_SCAN_BK), N * H)
 
+    if dkappa is not None:
+        assert dkappa.shape == k.shape[:3] and dkappa.dtype == torch.float32 and dkappa.is_contiguous()
     _atk_backward_chunk_out[grid](
-        k, g_raw, beta, ac, initial_A_state, dk_precond,
+        k, g_raw, beta, ac, initial_A_state, dk_precond, dkappa,
         gk, gg, gbeta, gac_prev, dh0,
         g_log_atk_scale,
         cu_seqlens, chunk_indices,

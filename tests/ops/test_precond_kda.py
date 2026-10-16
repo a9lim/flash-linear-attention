@@ -407,6 +407,86 @@ def test_chunk(
 
 
 @pytest.mark.parametrize(
+    ("B", "T", "H", "D", "disable_recompute", "dtype"),
+    [
+        pytest.param(*test, id="B{}-T{}-H{}-D{}-keep{}-{}".format(*test))
+        for test in [
+            (2, 500, 3, 64, False, torch.bfloat16),
+            (2, 1024, 4, 128, False, torch.bfloat16),
+            (2, 1024, 4, 128, True, torch.bfloat16),
+        ]
+    ],
+)
+def test_chunk_normalized_beta(B: int, T: int, H: int, D: int, disable_recompute: bool, dtype: torch.dtype):
+    """beta read as the error fraction at the read key, beta in (0, 2): outputs and
+    every gradient, including the ones kappa routes into k and the ATK inputs."""
+    torch.manual_seed(42)
+    q = F.normalize(torch.randn(B, T, H, D), dim=-1).to(dtype)
+    k = F.normalize(torch.randn(B, T, H, D), dim=-1).to(dtype)
+    v = torch.randn(B, T, H, D, dtype=dtype)
+    gk = torch.randn(B, T, H, D, dtype=dtype)
+    A_log = torch.empty(H).uniform_(1, 16).log()
+    dt_bias = torch.randn(H * D) - 3
+    g_atk = F.logsigmoid(torch.randn(B, T, H) + 3)
+    beta_atk = torch.randn(B, T, H, dtype=dtype).sigmoid()
+    beta = 2 * torch.randn(B, T, H).sigmoid().to(dtype)
+    log_atk_scale = torch.full((H,), -0.2)
+    h0 = torch.randn(B, H, D, D) * 0.1
+    leaves = [
+        x.to(device).requires_grad_(True)
+        for x in (q, k, v, gk, A_log, dt_bias, g_atk, beta_atk, beta, log_atk_scale, h0)
+    ]
+    q, k, v, gk, A_log, dt_bias, g_atk, beta_atk, beta, log_atk_scale, h0 = leaves
+    do = torch.randn_like(v)
+    dht = torch.randn_like(h0)
+
+    ref, ref_ht, _ = naive_recurrent_precond_kda(
+        q=q, k=k, v=v, g=naive_kda_gate(gk, A_log, dt_bias), g_atk=g_atk, beta_atk=beta_atk, beta=beta,
+        initial_state=h0, output_final_state=True, x=1.5, log_atk_scale=log_atk_scale, normalize_beta=True,
+    )
+    ref_grads = torch.autograd.grad((ref * do).sum() + (ref_ht * dht).sum(), leaves)
+    tri, tri_ht, _ = chunk_precond_kda(
+        q=q, k=k, v=v, g=gk, g_atk=g_atk, beta_atk=beta_atk, beta=beta, A_log=A_log, dt_bias=dt_bias,
+        initial_state=h0, output_final_state=True, use_gate_in_kernel=True, use_qk_l2norm_in_kernel=False,
+        disable_recompute=disable_recompute, x=1.5, log_atk_scale=log_atk_scale, normalize_beta=True,
+    )
+    tri_grads = torch.autograd.grad((tri * do).sum() + (tri_ht * dht).sum(), leaves)
+
+    assert_close("o", ref, tri, 0.005)
+    assert_close("ht", ref_ht, tri_ht, 0.005)
+    names = ("dq", "dk", "dv", "dg", "dA", "dbias", "dg_atk", "dbeta_atk", "dbeta", "dlog_atk_scale", "dh0")
+    tolerances = (0.008, 0.008, 0.008, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.008)
+    for name, ref_grad, tri_grad, tolerance in zip(names, ref_grads, tri_grads, tolerances, strict=True):
+        assert_close(name, ref_grad, tri_grad, tolerance)
+
+
+def test_fused_recurrent_normalized_beta():
+    """Decode with beta read as the error fraction matches the naive recurrence."""
+    torch.manual_seed(42)
+    B, T, H, D = 2, 64, 4, 128
+    q = F.normalize(torch.randn(B, T, H, D, device=device), dim=-1)
+    k = F.normalize(torch.randn(B, T, H, D, device=device), dim=-1)
+    v = torch.randn(B, T, H, D, device=device)
+    g = F.logsigmoid(torch.randn(B, T, H, D, device=device) + 3)
+    g_atk = F.logsigmoid(torch.randn(B, T, H, device=device) + 3)
+    beta_atk = torch.randn(B, T, H, device=device).sigmoid()
+    beta = 2 * torch.randn(B, T, H, device=device).sigmoid()
+    log_atk_scale = torch.full((H,), -0.2, device=device)
+    h0 = torch.randn(B, H, D, D, device=device) * 0.1
+    a0 = torch.rand(B, H, D, device=device) * 0.1
+    common = dict(
+        initial_state=h0, initial_A_state=a0, output_final_state=True, x=1.5,
+        log_atk_scale=log_atk_scale, normalize_beta=True,
+    )
+    ref, ref_ht, ref_at = naive_recurrent_precond_kda(q, k, v, g, g_atk, beta_atk, beta, **common)
+    tri, tri_ht, tri_at = fused_recurrent_precond_kda(
+        q, k, v, g, g_atk, beta_atk, beta, use_qk_l2norm_in_kernel=False, **common)
+    assert_close("o", ref, tri, 0.002)
+    assert_close("ht", ref_ht, tri_ht, 0.002)
+    assert_close("at", ref_at, tri_at, 0.002)
+
+
+@pytest.mark.parametrize(
     ("B", "T", "H", "K", "V", "scale", "gate_logit_normalizer", "dtype"),
     [
         pytest.param(

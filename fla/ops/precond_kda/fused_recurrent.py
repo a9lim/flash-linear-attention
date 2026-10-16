@@ -81,6 +81,7 @@ def fused_recurrent_precond_kda_fwd_kernel(
     USE_GATE_IN_KERNEL: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
     TRANSPOSE_STATE: tl.constexpr,
+    NORMALIZE_BETA: tl.constexpr,
     num_stages: tl.constexpr,
 ):
     pid = tl.program_id(0).to(tl.int64)
@@ -229,6 +230,10 @@ def fused_recurrent_precond_kda_fwd_kernel(
             b_beta = tl.load(p_beta, mask=mask_v, other=0, eviction_policy='evict_first').to(tl.float32)
         else:
             b_beta = tl.load(p_beta, eviction_policy='evict_last').to(tl.float32)
+        if NORMALIZE_BETA:
+            # beta is the error fraction at the read key; BK covers K, so this
+            # is the whole k . k_precond.
+            b_beta = b_beta / tl.sum(b_k * b_k_precond)
         b_v *= b_beta
         if TRANSPOSE_STATE:
             b_h += b_v[:, None] * b_k_precond[None, :]
@@ -320,6 +325,7 @@ def fused_recurrent_precond_kda_fwd(
     x: float = 1.5,
     eps: float = 1e-6,
     log_atk_scale: torch.Tensor = None,
+    normalize_beta: bool = False,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     if scale is None:
@@ -407,6 +413,7 @@ def fused_recurrent_precond_kda_fwd(
         INPLACE_FINAL_STATE=inplace_final_state,
         USE_GATE_IN_KERNEL=use_gate_in_kernel,
         TRANSPOSE_STATE=transpose_state_layout,
+        NORMALIZE_BETA=normalize_beta,
         num_warps=4,
         num_stages=2,
     )
@@ -437,6 +444,7 @@ def fused_recurrent_precond_kda(
     x: float = 1.5,
     eps: float = 1e-6,
     log_atk_scale: torch.Tensor = None,
+    normalize_beta: bool = False,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     r"""
@@ -494,6 +502,9 @@ def fused_recurrent_precond_kda(
             Epsilon for numerical stability. Default: `1e-6`.
         log_atk_scale (Optional[torch.Tensor]):
             Per-head log-space center of shape `[H]`. Default: `None`.
+        normalize_beta (bool):
+            Read `beta` as the fraction of the error corrected at the read key, as
+            `chunk_precond_kda` does. Default: `False`.
 
     Returns:
         o (torch.Tensor):
@@ -573,5 +584,6 @@ def fused_recurrent_precond_kda(
         x=x,
         eps=eps,
         log_atk_scale=log_atk_scale,
+        normalize_beta=normalize_beta,
     )
     return o, final_state, final_A_state

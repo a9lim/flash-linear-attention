@@ -47,6 +47,7 @@ def chunk_precond_kda_fwd(
     log_atk_scale: torch.Tensor = None,
     transpose_state_layout: bool = False,
     output_qg: bool = False,
+    normalize_beta: bool = False,
 ):
     """
     Forward pass for preconditioned KDA.
@@ -65,11 +66,15 @@ def chunk_precond_kda_fwd(
         x: range parameter for symmetric squash. M in [1/x, x]
         eps: epsilon for log safety
         log_atk_scale: per-head log-space center [H]
+        normalize_beta: read ``beta`` as the fraction of the error corrected at the
+            read key, so the write step is ``beta / kappa`` with ``kappa = k . k_precond``
 
     Returns:
-        o, Aqk, Akk, final_state, at, w, u, kg, v_new, h, k_precond, ac_atk, a_atk, sa_atk
+        o, Aqk, Akk, final_state, at, w, u, kg, v_new, h, k_precond, ac_atk, a_atk, sa_atk, qg,
+        kappa (FP32 [B, T, H] with ``normalize_beta``, else None)
     """
     B, T, H, K = k.shape
+    kappa = k.new_empty(B, T, H, dtype=torch.float32) if normalize_beta else None
 
     # Step 1: ATK preconditioning with symmetric fast squash
     # k_precond and the scan buffers are kept for backward instead of recomputed
@@ -84,7 +89,12 @@ def chunk_precond_kda_fwd(
         x=x,
         eps=eps,
         log_atk_scale=log_atk_scale,
+        kappa=kappa,
     )
+    if normalize_beta:
+        # One update then leaves S^T k = (1 - beta) S^T k + beta v, and the
+        # update's only non-unit eigenvalue is 1 - beta.
+        beta = beta.float() / kappa
 
     # Step 2: KDA intra-chunk computation (asymmetric)
     # Aqk = q @ k_precond^T, Akk = k @ k_precond^T
@@ -134,7 +144,7 @@ def chunk_precond_kda_fwd(
         qg=qg,
     )
 
-    return o, Aqk, Akk, final_state, at, w, u, kg, v_new, h, k_precond, ac_atk, a_atk, sa_atk, qg
+    return o, Aqk, Akk, final_state, at, w, u, kg, v_new, h, k_precond, ac_atk, a_atk, sa_atk, qg, kappa
 
 
 def chunk_precond_kda_bwd(
@@ -173,13 +183,21 @@ def chunk_precond_kda_bwd(
     a_atk: torch.Tensor | None = None,
     sa_atk: torch.Tensor | None = None,
     qg: torch.Tensor | None = None,
+    normalize_beta: bool = False,
+    kappa: torch.Tensor | None = None,
 ):
     """
     Backward pass for preconditioned KDA with symmetric fast squash preconditioning.
 
+    With ``normalize_beta``, ``kappa`` is the forward's and ``beta`` is the
+    error fraction; the returned dbeta is its gradient.
+
     Returns:
         dq, dk, dv, dg, dg_atk, dbeta_atk, dbeta, d_log_atk_scale, dh0
     """
+    eta = beta
+    if normalize_beta:
+        beta = eta.float() / kappa
     # k_precond and the ATK scan buffers (ac_atk, a_atk, sa_atk) come from the forward.
     if not disable_recompute:
         # Step 1: Recompute WY representation (asymmetric)
@@ -300,6 +318,13 @@ def chunk_precond_kda_bwd(
 
     dk_precond_total = dk_precond2
 
+    dkappa = None
+    if normalize_beta:
+        # beta here is the step eta / kappa: d eta = d step / kappa, and kappa's
+        # gradient enters the ATK backward with the key gradients it owes.
+        dkappa = -dbeta2 * beta / kappa
+        dbeta2 = dbeta2 / kappa
+
     # The ATK summary kernel folds the intra backward's dk into its own output,
     # so `dk_total` comes back already in k.dtype with a single rounding.
     dk_total, dbeta_atk_grad, dg_atk, d_log_atk_scale, dh0_atk = chunk_atk_bwd(
@@ -317,6 +342,7 @@ def chunk_precond_kda_bwd(
         log_atk_scale=log_atk_scale,
         dat=dat,
         dk_intra=dk_intra,
+        dkappa=dkappa,
     )
 
     # dg3 from asymmetric intra backward already has reverse cumsum applied
@@ -360,6 +386,7 @@ class ChunkPrecondKDAFunction(torch.autograd.Function):
         solve_tril_precision: str | None = None,
         disable_recompute: bool = False,
         return_intermediate_states: bool = False,
+        normalize_beta: bool = False,
     ):
         chunk_size = 64
 
@@ -392,7 +419,7 @@ class ChunkPrecondKDAFunction(torch.autograd.Function):
             )
 
         (o, Aqk, Akk, final_state, at, w, u, kg, v_new, h,
-         k_precond, ac_atk, a_atk, sa_atk, qg) = chunk_precond_kda_fwd(
+         k_precond, ac_atk, a_atk, sa_atk, qg, kappa) = chunk_precond_kda_fwd(
             q=q,
             k=k,
             v=v,
@@ -415,6 +442,7 @@ class ChunkPrecondKDAFunction(torch.autograd.Function):
             log_atk_scale=log_atk_scale,
             transpose_state_layout=transpose_state_layout,
             output_qg=disable_recompute,
+            normalize_beta=normalize_beta,
         )
 
         if return_intermediate_states:
@@ -442,9 +470,10 @@ class ChunkPrecondKDAFunction(torch.autograd.Function):
             Aqk, Akk, initial_state,
             A_log, dt_bias, log_atk_scale, cu_seqlens, chunk_indices,
             w, u, kg, v_new, h,
-            k_precond, ac_atk, a_atk, sa_atk, qg
+            k_precond, ac_atk, a_atk, sa_atk, qg, kappa
         )
         ctx.scale = scale
+        ctx.normalize_beta = normalize_beta
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
         ctx.use_gate_in_kernel = use_gate_in_kernel
         ctx.safe_gate = safe_gate
@@ -467,7 +496,7 @@ class ChunkPrecondKDAFunction(torch.autograd.Function):
          Aqk, Akk, initial_state,
          A_log, dt_bias, log_atk_scale, cu_seqlens, chunk_indices,
          w, u, kg, v_new, h,
-         k_precond, ac_atk, a_atk, sa_atk, qg) = ctx.saved_tensors
+         k_precond, ac_atk, a_atk, sa_atk, qg, kappa) = ctx.saved_tensors
 
         # Recompute g (cumsummed) only when the forward dropped it
         if ctx.use_gate_in_kernel and g is None:
@@ -523,6 +552,8 @@ class ChunkPrecondKDAFunction(torch.autograd.Function):
             a_atk=a_atk,
             sa_atk=sa_atk,
             qg=qg,
+            normalize_beta=ctx.normalize_beta,
+            kappa=kappa,
         )
 
         if ctx.use_qk_l2norm_in_kernel:
@@ -579,6 +610,7 @@ class ChunkPrecondKDAFunction(torch.autograd.Function):
             None,  # solve_tril_precision
             None,  # disable_recompute
             None,  # return_intermediate_states
+            None,  # normalize_beta
         )
 
 
@@ -610,6 +642,7 @@ def chunk_precond_kda(
     disable_recompute: bool = False,
     return_intermediate_states: bool = False,
     use_qk_l2norm_in_kernel: bool = True,
+    normalize_beta: bool = False,
     **kwargs,
 ):
     r"""
@@ -694,6 +727,11 @@ def chunk_precond_kda(
             Epsilon for numerical stability in the squash function. Default: `1e-6`.
         log_atk_scale (Optional[torch.Tensor]):
             Per-head log-space center of shape `[H]`. Default: `None`.
+        normalize_beta (bool):
+            Read `beta` as the fraction of the error corrected at the read key: the
+            write step becomes `beta / (k . k_precond)`, so one update leaves
+            `S^T k = (1 - beta) S^T k + beta v` and `beta` in `(0, 2)` keeps the
+            update's only non-unit eigenvalue in `(-1, 1)`. Default: `False`.
 
     Returns:
         - Normal mode (return_intermediate_states=False): A tuple (o, final_state, A_state)
@@ -827,6 +865,7 @@ def chunk_precond_kda(
         solve_tril_precision,
         disable_recompute,
         return_intermediate_states,
+        normalize_beta,
     )
 
     if return_intermediate_states:
