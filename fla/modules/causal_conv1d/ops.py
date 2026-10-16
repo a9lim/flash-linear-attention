@@ -67,7 +67,6 @@ def causal_conv1d_fwd_kernel(
     BT: tl.constexpr,
     BW: tl.constexpr,
     BD: tl.constexpr,
-    NB: tl.constexpr,
     ACTIVATION: tl.constexpr,
     HAS_WEIGHT: tl.constexpr,
     HAS_BIAS: tl.constexpr,
@@ -193,7 +192,6 @@ def causal_conv1d_bwd_kernel(
     BT: tl.constexpr,
     BW: tl.constexpr,
     BD: tl.constexpr,
-    NB: tl.constexpr,
     ACTIVATION: tl.constexpr,
     HAS_WEIGHT: tl.constexpr,
     HAS_BIAS: tl.constexpr,
@@ -1034,7 +1032,6 @@ def causal_conv1d_fwd(
     if cu_seqlens is not None and chunk_indices is None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT, cu_seqlens_cpu=cu_seqlens_cpu)
     NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
-    NB = triton.cdiv(B*T, 1024)
 
     y = torch.empty_like(x, memory_format=torch.contiguous_format)
 
@@ -1059,7 +1056,6 @@ def causal_conv1d_fwd(
         W=W,
         BT=BT,
         BW=BW,
-        NB=NB,
         ACTIVATION=activation,
     )
     final_state = None
@@ -1205,7 +1201,6 @@ def causal_conv1d_bwd(
     if cu_seqlens is not None and chunk_indices is None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT, cu_seqlens_cpu=cu_seqlens_cpu)
     NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
-    NB = triton.cdiv(B*T, 1024)
 
     y = None
     if activation is not None:
@@ -1258,7 +1253,6 @@ def causal_conv1d_bwd(
         W=W,
         BT=BT,
         BW=BW,
-        NB=NB,
         ACTIVATION=activation,
     )
     if weight is not None:
