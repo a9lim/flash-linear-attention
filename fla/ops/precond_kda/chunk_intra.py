@@ -12,6 +12,7 @@ import triton.language as tl
 from fla.ops.precond_kda.chunk_intra_token_parallel import chunk_precond_kda_fwd_intra_token_parallel
 from fla.ops.precond_kda.wy_fast import recompute_w_u_fwd
 from fla.ops.utils import chunk_local_cumsum, prepare_chunk_indices
+from fla.ops.utils.constant import RCP_LN2
 from fla.ops.utils.op import exp2, gather, unflatten_program_id
 from fla.utils import IS_GATHER_SUPPORTED, IS_TF32_SUPPORTED, autotune_cache_kwargs
 
@@ -405,6 +406,7 @@ def chunk_precond_kda_fwd_kernel_intra_sub_chunk(
     BC: tl.constexpr,
     BK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    GATE_SHIFT: tl.constexpr,
     USE_GATHER: tl.constexpr,
 ):
     """
@@ -450,16 +452,14 @@ def chunk_precond_kda_fwd_kernel_intra_sub_chunk(
     b_g = tl.load(p_g, mask=m_ck, other=0.0)
     b_beta = tl.load(beta + o_c*H, mask=m_c, other=0.0)
 
+    # Causal reference: the block's first cumulative gate, shifted toward the
+    # block's estimated midpoint (see chunk_precond_kda_fwd_intra).
     if USE_GATHER:
-        b_gn = gather(b_g, tl.full([1, BK], min(BC//2, T - i_ti - 1), dtype=tl.int16), axis=0)
+        b_gn = gather(b_g, tl.zeros([1, BK], dtype=tl.int16), axis=0)
     else:
-        # calculate offset
-        p_gn = g + (i_ti + min(BC // 2, T - i_ti - 1)) * H*K + tl.arange(0, BK)
-        b_gn = tl.load(p_gn, mask=tl.arange(0, BK) < K, other=0.0)
-        b_gn = b_gn[None, :]
+        b_gn = tl.load(g + i_ti * H*K + o_k, mask=o_k < K, other=0.0)[None, :]
+    b_gn = b_gn - 0.5 * (BC - 1) * GATE_SHIFT
 
-    # current block, keep numerical stability by subtracting the left boundary
-    # less than 85 to avoid overflow in exp2
     b_gm = (b_g - b_gn).to(tl.float32)
 
     b_gq = tl.where(m_c[:, None], exp2(b_gm), 0.)
@@ -513,9 +513,20 @@ def chunk_precond_kda_fwd_intra(
     chunk_indices: torch.LongTensor | None = None,
     solve_tril_precision: str | None = None,
     safe_gate: bool = False,
+    lower_bound: float | None = None,
 ):
     """
     Forward pass for preconditioned KDA intra-chunk.
+
+    With ``safe_gate`` the diagonal 16x16 blocks run as Tensor Core matmuls,
+    splitting ``exp(G_i - G_j) = exp(G_i - C) * exp(C - G_j)`` around a
+    per-block reference ``C``. As in KDA, ``C`` is the block's first
+    cumulative gate shifted by ``d = (BC - 1) * s / 2`` in natural-log units,
+    with ``s = -lower_bound`` when given here and 2 otherwise, so no causal
+    score reads a later token's gate. ``chunk_precond_kda`` keeps the default.
+    For log gates in ``[L, 0]`` with ``BC = 16`` and ``s = 2`` the factors stay
+    below ``exp(15)`` on the query side and ``exp(-15 L - 15)`` on the key side
+    (``exp(60)`` at ``L = -5``).
 
     Args:
         q: [B, T, H, K] - queries
@@ -572,6 +583,7 @@ def chunk_precond_kda_fwd_intra(
             BT=BT,
             BC=BC,
             BK=BK,
+            GATE_SHIFT=(-lower_bound if lower_bound is not None else 2.) * RCP_LN2,
             USE_GATHER=IS_GATHER_SUPPORTED,
         )
     else:
@@ -632,6 +644,14 @@ def chunk_precond_kda_fwd_intra(
 BWD_INTRA_BK = 32
 
 
+def _prune_safe_gate_sub_chunks(configs, named_args, **kwargs):
+    # The safe-gate diagonal factors are bounded for 16-token blocks only; at
+    # BC=32 the key side reaches exp(-31 L - 31), past FP32 at L=-5.
+    if kwargs.get('SAFE_GATE', named_args.get('SAFE_GATE', False)):
+        return [config for config in configs if config.kwargs['BC'] == 16]
+    return configs
+
+
 @triton.heuristics({
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
@@ -642,7 +662,8 @@ BWD_INTRA_BK = 32
         for num_warps in [1, 2, 4, 8]
         for num_stages in [2, 3]
     ],
-    key=['BK', 'BT', 'K', 'H'],
+    key=['BK', 'BT', 'K', 'H', 'SAFE_GATE'],
+    prune_configs_by={'early_config_prune': _prune_safe_gate_sub_chunks},
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['B', 'T'])
@@ -674,6 +695,7 @@ def chunk_precond_kda_bwd_kernel_intra(
     BK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     SAFE_GATE: tl.constexpr = False,
+    GATE_SHIFT: tl.constexpr = 0.,
     USE_GATHER: tl.constexpr = False,
 ):
     """
@@ -775,12 +797,13 @@ def chunk_precond_kda_bwd_kernel_intra(
     b_k = tl.load(p_k, mask=m_ti[:, None] & m_k[None, :], other=0.0).to(tl.float32)
 
     if SAFE_GATE:
-        # Vectorized upper diagonal (dq2/dk2): column side uses k_precond
+        # Vectorized upper diagonal (dq2/dk2): column side uses k_precond.
+        # The forward's causal reference, recomputed for the query-side factors.
         if USE_GATHER:
-            b_gn = gather(b_g, tl.full([1, BK], min(BC//2, T - i_ti - 1), dtype=tl.int16), axis=0)
+            b_gn = gather(b_g, tl.zeros([1, BK], dtype=tl.int16), axis=0)
         else:
-            p_gn = g + (i_ti + min(BC // 2, T - i_ti - 1)) * H*K + o_k
-            b_gn = tl.load(p_gn, mask=m_k, other=0)[None, :]
+            b_gn = tl.load(g + i_ti * H*K + o_k, mask=m_k, other=0).to(tl.float32)[None, :]
+        b_gn = b_gn - 0.5 * (BC - 1) * GATE_SHIFT
 
         p_kp_diag = k_precond + o_ti[:, None] * (H*K) + o_k[None, :]
         b_kp_diag = tl.load(p_kp_diag, mask=m_ti[:, None] & m_k[None, :], other=0.0).to(tl.float32)
@@ -876,12 +899,13 @@ def chunk_precond_kda_bwd_kernel_intra(
         b_dkt *= exp2(b_gn_t[None, :] - b_g)
 
     if SAFE_GATE:
-        # Vectorized lower diagonal (dkt): row side uses q and k*beta
+        # Vectorized lower diagonal (dkt): row side uses q and k*beta.
+        # The same reference, so the shared offset cancels on the key side.
         if USE_GATHER:
-            b_gn_t2 = gather(b_g, tl.full([1, BK], min(BC//2, T - i_ti - 1), dtype=tl.int16), axis=0)
+            b_gn_t2 = gather(b_g, tl.zeros([1, BK], dtype=tl.int16), axis=0)
         else:
-            p_gn_t2 = g + (i_ti + min(BC // 2, T - i_ti - 1)) * H*K + o_k
-            b_gn_t2 = tl.load(p_gn_t2, mask=m_k, other=0).to(tl.float32)[None, :]
+            b_gn_t2 = tl.load(g + i_ti * H*K + o_k, mask=m_k, other=0).to(tl.float32)[None, :]
+        b_gn_t2 = b_gn_t2 - 0.5 * (BC - 1) * GATE_SHIFT
         p_q_diag = q + o_ti[:, None] * (H*K) + o_k[None, :]
         b_q_diag = tl.load(p_q_diag, mask=m_ti[:, None] & m_k[None, :], other=0.0).to(tl.float32)
         b_b_diag = tl.load(beta + o_ti*H, mask=m_ti, other=0.0).to(tl.float32)
@@ -967,10 +991,14 @@ def chunk_precond_kda_bwd_intra(
     chunk_indices: torch.LongTensor | None = None,
     chunk_size: int = 64,
     safe_gate: bool = False,
+    lower_bound: float | None = None,
     defer_reverse_cumsum: bool = False,
 ):
     """
     Asymmetric intra backward for preconditioned KDA.
+
+    ``safe_gate`` runs 16-token diagonal blocks around the forward's causal
+    reference; ``lower_bound`` sets its shift as in the forward.
 
     With ``defer_reverse_cumsum`` the returned ``dg`` is the raw per-position
     gradient; the chunk-local reverse cumsum is the caller's to apply.
@@ -1018,6 +1046,7 @@ def chunk_precond_kda_bwd_intra(
         BT=BT,
         BK=BK,
         SAFE_GATE=safe_gate,
+        GATE_SHIFT=(-lower_bound if lower_bound is not None else 2.) * RCP_LN2,
         USE_GATHER=IS_GATHER_SUPPORTED,
     )
 

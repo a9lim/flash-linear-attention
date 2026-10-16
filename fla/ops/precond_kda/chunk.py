@@ -654,7 +654,10 @@ def chunk_precond_kda(
             the per-step decay factor ``exp(g)`` is bounded in ``[exp(-5), 1) ≈ [0.0067, 1)``,
             meaning each step retains at least ~0.67% of the state -- a negligible loss that
             has minimal impact on model quality while enabling significant speedup.
-            Requires ``lower_bound`` to be set. Default: ``False``.
+            With ``use_gate_in_kernel=True``, requires ``lower_bound`` and bounds gates to
+            ``[lower_bound, 0)``. Otherwise, the caller must provide pre-computed bounded gates.
+            Diagonal blocks are scaled around a causal per-block reference, so no output
+            depends on a later token's gate. Default: ``False``.
         lower_bound (Optional[float]):
             Lower bound for the forget gate (in log space) when ``use_gate_in_kernel=True``.
             Changes the gate activation from ``-exp(A_log) * softplus(g + dt_bias)``
