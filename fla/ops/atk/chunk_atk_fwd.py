@@ -27,7 +27,21 @@ import triton
 import triton.language as tl
 
 from fla.backends import dispatch
-from fla.utils import IS_NVIDIA_HOPPER
+
+ATK_SCAN_STAGES = 4
+"""How far ahead either chunk scan fetches.
+
+A sequence, head, and state slice is one program, which leaves the launch far
+too narrow to cover memory latency with other programs, and each scan's loads
+depend only on their own chunk index, so the pipeline covers it instead.
+"""
+
+ATK_SCAN_BK = 32
+"""State width one scan program carries, forward and reverse.
+
+The carry is elementwise in the state, so splitting it multiplies the
+launch's programs without changing what any of them computes.
+"""
 
 
 @triton.heuristics({
@@ -136,10 +150,14 @@ def _forward_pass_chunks(
     sa_stride_b, sa_stride_c, sa_stride_h,
     ac_stride_b, ac_stride_c, ac_stride_h, ac_stride_d,
     BK: tl.constexpr,
+    SCAN_STAGES: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
-    i_nh = tl.program_id(0).to(tl.int64)
+    """Sequential pass across chunks, one program per state slice of a sequence
+    and head, mirroring the reverse scan in the backward."""
+    i_k = tl.program_id(0).to(tl.int64)
+    i_nh = tl.program_id(1).to(tl.int64)
 
     if IS_VARLEN:
         i_n = i_nh // H
@@ -158,32 +176,25 @@ def _forward_pass_chunks(
         return
 
     N_chunks = tl.cdiv(T, CHUNK_LEN)
+    D_range = i_k * BK + tl.arange(0, BK)
+    D_mask = D_range < D
 
-    for i_k in range(tl.cdiv(D, BK)):
-        d_offset = i_k * BK
-        D_range = d_offset + tl.arange(0, BK)
-        D_mask = D_range < D
+    sa_base = sa + b * sa_stride_b + h * sa_stride_h
+    a_base = a + b * a_stride_b + h * a_stride_h + D_range * a_stride_d
+    ac_base = ac + b * ac_stride_b + h * ac_stride_h + D_range * ac_stride_d
 
-        sa_ptr = sa + b * sa_stride_b + h * sa_stride_h
-        a_ptr = a + b * a_stride_b + h * a_stride_h + D_range * a_stride_d
-        ac_ptr = ac + b * ac_stride_b + h * ac_stride_h + D_range * ac_stride_d
+    if USE_INITIAL_STATE:
+        ac_val = tl.load(h0 + i_nh * D + D_range, mask=D_mask, other=0).to(tl.float32)
+    else:
+        ac_val = tl.zeros([BK], dtype=tl.float32)
 
-        if USE_INITIAL_STATE:
-            ac_val = tl.load(h0 + i_nh * D + D_range, mask=D_mask, other=0).to(tl.float32)
-        else:
-            ac_val = tl.zeros([BK], dtype=tl.float32)
+    for chunk_id in tl.range(N_chunks, num_stages=SCAN_STAGES):
+        a_val = tl.load(a_base + chunk_id * a_stride_c, mask=D_mask).to(tl.float32)
+        sa_val = tl.load(sa_base + chunk_id * sa_stride_c).to(tl.float32)
 
-        for chunk_id in tl.range(N_chunks):
-            a_val = tl.load(a_ptr, D_mask).to(tl.float32)
-            sa_val = tl.load(sa_ptr).to(tl.float32)
+        ac_val = tl.exp(sa_val) * ac_val + a_val
 
-            ac_val = tl.exp(sa_val) * ac_val + a_val
-
-            tl.store(ac_ptr, ac_val, mask=D_mask)
-
-            sa_ptr += sa_stride_c
-            a_ptr += a_stride_c
-            ac_ptr += ac_stride_c
+        tl.store(ac_base + chunk_id * ac_stride_c, ac_val, mask=D_mask)
 
 
 @triton.heuristics({
@@ -324,8 +335,6 @@ def _atk_fwd_stages(
     CHUNK_LEN = chunk_size
 
     BK = D if os.environ.get('ATK_NO_KTILE') else 32  # K-tile size (set ATK_NO_KTILE=1 to disable)
-    # one full-width sweep avoids four serial walks through the chunks on Hopper
-    scan_bk = 128 if IS_NVIDIA_HOPPER and D == 128 else BK
 
     is_varlen = cu_seqlens is not None
 
@@ -364,12 +373,13 @@ def _atk_fwd_stages(
 
     logx = math.log(x) if x > 0 else 0.0
 
+    scan_bk = min(ATK_SCAN_BK, triton.next_power_of_2(D))
     if is_varlen:
         grid = (NT, H, 1)
-        grid2 = (N * H,)
+        grid2 = (triton.cdiv(D, scan_bk), N * H)
     else:
         grid = (B, H, num_chunks)
-        grid2 = (B * H,)
+        grid2 = (triton.cdiv(D, scan_bk), B * H)
 
     _forward_chunk_summary[grid](
         k, beta, log_g, a, sa,
@@ -391,7 +401,7 @@ def _atk_fwd_stages(
         a.stride(0), a.stride(1), a.stride(2), a.stride(3),
         sa.stride(0), sa.stride(1), sa.stride(2),
         ac.stride(0), ac.stride(1), ac.stride(2), ac.stride(3),
-        scan_bk, num_warps=4
+        scan_bk, SCAN_STAGES=ATK_SCAN_STAGES, num_warps=4
     )
 
     _forward_chunk_out[grid](

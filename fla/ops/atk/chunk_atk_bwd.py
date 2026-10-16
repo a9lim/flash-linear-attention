@@ -15,22 +15,8 @@ import triton
 import triton.language as tl
 
 from fla.backends import dispatch
+from fla.ops.atk.chunk_atk_fwd import ATK_SCAN_BK, ATK_SCAN_STAGES
 from fla.ops.utils import prepare_chunk_indices
-
-ATK_SCAN_STAGES = 4
-"""How far ahead the reverse chunk scan fetches.
-
-A sequence and head is one program, which leaves the launch far too narrow to
-cover memory latency with other programs, and the scan's loads depend only on
-their own chunk index, so the pipeline covers it instead.
-"""
-
-ATK_SCAN_BK = 32
-"""State width one reverse-scan program carries.
-
-The carry is elementwise in the state, so splitting it multiplies the
-launch's programs without changing what any of them computes.
-"""
 
 
 @triton.heuristics({

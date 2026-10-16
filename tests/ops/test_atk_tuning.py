@@ -5,7 +5,6 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
-import importlib
 import math
 
 import pytest
@@ -13,7 +12,8 @@ import torch
 import torch.nn.functional as F
 
 from fla.ops.atk.chunk_atk_bwd import chunk_atk_bwd
-from fla.utils import IS_NVIDIA_HOPPER, assert_close, device
+from fla.ops.atk.chunk_atk_fwd import chunk_atk_fwd
+from fla.utils import assert_close, device
 
 
 def _reference(k, beta, g, center, initial):
@@ -28,66 +28,55 @@ def _reference(k, beta, g, center, initial):
     return torch.stack(outputs, dim=1).to(k.dtype), state
 
 
-@pytest.mark.skipif(not IS_NVIDIA_HOPPER, reason='Hopper ATK scan tile')
-@pytest.mark.parametrize('length', [128, 129], ids=['aligned', 'partial-tail'])
-def test_atk_hopper_scan_outputs_and_gradients(length, monkeypatch):
+@pytest.mark.parametrize('length', [128, 129, 4096], ids=['aligned', 'partial-tail', 'long'])
+def test_atk_scan_outputs_and_gradients(length):
+    """Both chunk scans walk one state slice per program; outputs, the FP32 final
+    state, and every gradient match the token-by-token reference."""
     torch.manual_seed(42)
-    module = importlib.import_module('fla.ops.atk.chunk_atk_fwd')
-    monkeypatch.delenv('ATK_NO_KTILE', raising=False)
-    shape = (1, length, 2, 128)
+    shape = (2, length, 2, 128)
     values = (
         F.normalize(torch.randn(shape, device=device), dim=-1).bfloat16(),
         (torch.rand(shape[:-1], device=device) * .5).bfloat16(),
         -torch.rand(shape[:-1], device=device) * .1,
         torch.full((2,), -.2, device=device),
-        torch.rand(1, 2, 128, device=device) * .1,
+        torch.rand(2, 2, 128, device=device) * .1,
     )
-    douts = (torch.randn_like(values[0]), torch.randn_like(values[4]).bfloat16())
+    douts = (torch.randn_like(values[0]), torch.randn_like(values[4]))
     leaves = tuple(value.detach().clone().requires_grad_() for value in values)
     expected_outputs = _reference(*leaves)
     expected_gradients = torch.autograd.grad(expected_outputs, leaves, grad_outputs=douts)
-    results = []
-    for hopper in (False, True):
-        k, beta, g, center, initial = values
-        with monkeypatch.context() as patch:
-            patch.setattr(module, 'IS_NVIDIA_HOPPER', hopper)
-            output, ac, a, sa, final = module.chunk_atk_fwd(
-                k=k,
-                beta=beta,
-                log_g=g,
-                initial_A_state=initial,
-                output_final_state=True,
-                x=1.5,
-                eps=1e-6,
-                log_atk_scale=center,
-            )
-        for buffer in (ac, a, sa):
-            assert buffer.dtype == torch.float32 and torch.isfinite(buffer).all()
-        dk, dbeta, dg, dcenter, dinitial = chunk_atk_bwd(
-            k=k,
-            g_raw=g,
-            beta=beta,
-            dk_precond=douts[0],
-            ac=ac,
-            a=a,
-            sa=sa,
-            initial_A_state=initial,
-            x=1.5,
-            eps=1e-6,
-            log_atk_scale=center,
-            dat=douts[1],
-        )
-        gradients = (dk, dbeta, dg, dcenter, dinitial)
-        for gradient in gradients:
-            assert gradient.dtype == torch.float32 and torch.isfinite(gradient).all()
-        results.append((output, final, *gradients))
+    k, beta, g, center, initial = values
+    output, ac, a, sa, final = chunk_atk_fwd(
+        k=k,
+        beta=beta,
+        log_g=g,
+        initial_A_state=initial,
+        output_final_state=True,
+        x=1.5,
+        eps=1e-6,
+        log_atk_scale=center,
+    )
+    for buffer in (ac, a, sa, final):
+        assert buffer.dtype == torch.float32 and torch.isfinite(buffer).all()
+    dk, dbeta, dg, dcenter, dinitial = chunk_atk_bwd(
+        k=k,
+        g_raw=g,
+        beta=beta,
+        dk_precond=douts[0],
+        ac=ac,
+        a=a,
+        sa=sa,
+        initial_A_state=initial,
+        x=1.5,
+        eps=1e-6,
+        log_atk_scale=center,
+        dat=douts[1],
+    )
     names = ('output', 'final_state', 'dk', 'dbeta', 'dg', 'dcenter', 'dinitial')
     # same reference budgets as the existing PKDA state/gradient tests
     tolerances = (.005, .005, .008, .02, .02, .02, .02)
     reference = (*expected_outputs, *expected_gradients)
-    for outputs in results:
-        for name, expected, actual, tolerance in zip(names, reference, outputs, tolerances, strict=True):
-            assert torch.isfinite(expected).all() and torch.isfinite(actual).all(), name
-            assert_close(name, expected.float(), actual.float(), tolerance)
-    for name, baseline, actual in zip(names, *results, strict=True):
-        assert_close(name, baseline.float(), actual.float(), .006)
+    actual = (output, final, dk, dbeta, dg, dcenter, dinitial)
+    for name, expected, value, tolerance in zip(names, reference, actual, tolerances, strict=True):
+        assert torch.isfinite(value).all(), name
+        assert_close(name, expected.float(), value.float(), tolerance)
