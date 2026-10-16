@@ -14,6 +14,7 @@ import torch
 import triton
 import triton.language as tl
 
+from fla.backends import dispatch
 from fla.ops.utils import prepare_chunk_indices
 
 ATK_SCAN_STAGES = 4
@@ -488,6 +489,7 @@ def _atk_backward_chunk_summary(
     tl.store(gbeta_ptr, gbeta_val, mask=mask_T)
 
 
+@dispatch('atk')
 def chunk_atk_bwd(
     k: torch.Tensor,
     g_raw: torch.Tensor,

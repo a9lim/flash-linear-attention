@@ -26,6 +26,7 @@ import torch
 import triton
 import triton.language as tl
 
+from fla.backends import dispatch
 from fla.utils import IS_NVIDIA_HOPPER
 
 
@@ -419,7 +420,7 @@ def _atk_fwd_stages(
     return k_precond.to(k.dtype), ac, a, sa, at
 
 
-@torch._dynamo.disable
+@dispatch('atk')
 def chunk_atk_fwd(
     k: torch.Tensor,
     beta: torch.Tensor,
@@ -445,7 +446,7 @@ def chunk_atk_fwd(
     )
 
 
-@torch._dynamo.disable
+@dispatch('atk')
 def recompute_atk_fwd(
     k: torch.Tensor,
     beta: torch.Tensor,
