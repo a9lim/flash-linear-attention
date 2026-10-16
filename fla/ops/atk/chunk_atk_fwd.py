@@ -408,14 +408,16 @@ def _atk_fwd_stages(
         num_warps=4
     )
 
+    # The final state stays in the scan's FP32, as the fused recurrent kernel
+    # keeps it, so a cached prefill hands decode the state it accumulated.
     at = None
     if output_final_state:
         if is_varlen:
             seq_lens = [cu_seqlens[i + 1] - cu_seqlens[i] for i in range(N)]
             last_chunk_indices = [triton.cdiv(s.item(), CHUNK_LEN) - 1 for s in seq_lens]
-            at = torch.stack([ac[i, last_chunk_indices[i], :, :] for i in range(N)], dim=0).to(k.dtype)
+            at = torch.stack([ac[i, last_chunk_indices[i], :, :] for i in range(N)], dim=0)
         else:
-            at = ac[:, -1, :, :].contiguous().to(k.dtype)
+            at = ac[:, -1, :, :].contiguous()
 
     return k_precond.to(k.dtype), ac, a, sa, at
 

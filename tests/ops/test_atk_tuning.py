@@ -25,7 +25,7 @@ def _reference(k, beta, g, center, initial):
         deviation = (state + 1e-6).log() - center[None, :, None]
         multiplier = (-math.log(1.5) * deviation / (1 + deviation.abs())).exp()
         outputs.append(key * multiplier)
-    return torch.stack(outputs, dim=1).to(k.dtype), state.to(k.dtype)
+    return torch.stack(outputs, dim=1).to(k.dtype), state
 
 
 @pytest.mark.skipif(not IS_NVIDIA_HOPPER, reason='Hopper ATK scan tile')

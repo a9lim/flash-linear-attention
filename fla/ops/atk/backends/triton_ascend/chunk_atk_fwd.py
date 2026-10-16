@@ -404,13 +404,15 @@ def _atk_fwd_stages_npu(
     else:
         _launch_chunk_grid(_forward_chunk_out_npu, B, H, math.ceil(T / CHUNK_LEN), out_args)
 
+    # The final state stays in the scan's FP32, as the fused recurrent kernel
+    # keeps it, so a cached prefill hands decode the state it accumulated.
     at = None
     if output_final_state:
         if is_varlen:
             last_chunk_indices = [triton.cdiv(s.item(), CHUNK_LEN) - 1 for s in seq_lens]
-            at = torch.stack([ac[i, last_chunk_indices[i], :, :] for i in range(N)], dim=0).to(k.dtype)
+            at = torch.stack([ac[i, last_chunk_indices[i], :, :] for i in range(N)], dim=0)
         else:
-            at = ac[:, -1, :, :].contiguous().to(k.dtype)
+            at = ac[:, -1, :, :].contiguous()
 
     return k_precond.to(k.dtype), ac, a, sa, at
 
